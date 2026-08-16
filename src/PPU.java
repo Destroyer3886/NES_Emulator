@@ -1,5 +1,7 @@
 public class PPU {
 
+    public static boolean DEBUG_SPRITE0 = false;
+
     // Standard NES System Palette (64 Colors)
     public static final int[] NES_PALETTE = {
             0x7C7C7C, 0x002492, 0x0000DB, 0x6800D4, 0x7C00A0, 0x6C0040, 0x5C0000, 0x501800,
@@ -27,59 +29,153 @@ public class PPU {
     public int ppuaddr = 0; //$2006
     public int ppudata = 0; //$2007
 
-    //Internal latches and VRAM address counters
-    private boolean addressLatch = false;
-    private int vramAddress = 0x0000;
-    private int tempAddress = 0x0000;
+    //Internal scroll/address latches, modeled the way real hardware actually does it
+    //("loopy" registers) rather than as raw PPUSCROLL bytes. v is the current VRAM
+    //address (also what $2007 reads/writes through) and doubles as the scroll
+    //position; t is the staging register that $2000/$2005/$2006 writes accumulate
+    //into; x is fine X scroll; w is the shared write toggle both $2005 and $2006 use.
+    //Each register is 15 bits: yyy NN YYYYY XXXXX (fine Y, nametable select, coarse Y,
+    //coarse X). Modeling it this way - instead of independent scrollX/scrollY bytes -
+    //is what makes mid-frame scroll-split tricks (SMB's status bar) come out right:
+    //v only picks up t's horizontal bits at cycle 257 of the *previous* scanline and
+    //its vertical bits during the pre-render line, exactly matching when real hardware
+    //latches a new scroll into the active picture, rather than applying every $2005
+    //write immediately.
+    private boolean addressLatch = false; //w
+    private int v = 0x0000;
+    private int t = 0x0000;
+    private int fineX = 0;
     private byte readBuffer = 0x00;
+
+    //Floating PPU data bus ($2xxx <-> CPU): every register access, read or write,
+    //leaves its value latched here. Reading a write-only register (or the unused low
+    //5 bits of $2002) returns this instead of a fixed 0, matching real hardware.
+    private int ppuDataBus = 0x00;
+
+    //Raw PPUSCROLL byte values, kept only for the DEBUG_SPRITE0 trace printouts.
+    private int scrollX = 0;
+    private int scrollY = 0;
 
     public int cycle = 0;
     public int scanline = 0;
 
+    //Debug-only: whether sprite-0-hit fired at any point during the frame that just
+    //ended, captured right before ppustatus's hit bit is cleared for the new frame
+    //(see step()). Exists because sampling ppustatus's live bit right after VBlank
+    //starts is meaningless - it's already been cleared for the *next* frame by then.
+    public boolean lastFrameHadHit = false;
+    private boolean hitOccurredThisFrame = false;
+
+    //Set for one PPU tick at the start of VBlank (scanline 241, cycle 1 - the same
+    //moment raiseNMI() fires). The main loop polls this to bound each "frame" of CPU
+    //execution instead of running a fixed CPU-cycle count, so it can never drift out
+    //of phase with the PPU's own continuous scanline/cycle counters - a fixed count
+    //doesn't evenly divide a real NTSC frame (89341/89342 PPU dots), so it used to
+    //slowly desync NMI timing from the CPU's notion of "one frame".
+    //
+    //Bounding on VBlank-start rather than the scanline-262 wrap also matches how NES
+    //games structure their own main loop (they treat NMI as "start of frame" and
+    //spend most of the frame - the visible scanlines - between one NMI and the next,
+    //hitting their "wait for VBlank" poll only right before the next NMI). Slicing the
+    //trace log the same way means a frame's trace starts right after NMI, instead of
+    //starting mid-VBlank and showing the wait-loop exit near the very end of the slice.
+    private boolean vblankStarted = false;
+    public boolean consumeVBlankStart() {
+        boolean result = vblankStarted;
+        vblankStarted = false;
+        return result;
+    }
+
     private Bus bus;
     private CPU cpu;
+    private NESDisplayPanel display;
 
     public void connectBus(Bus bus) { this.bus = bus; }
     public void connectCPU(CPU cpu) { this.cpu = cpu; }
+    public void connectDisplay(NESDisplayPanel display) { this.display = display; }
 
     public void reset() {
         ppuctrl = 0; ppumask = 0; ppustatus = 0;
         oamaddr = 0; ppuaddr = 0; ppudata = 0;
-        addressLatch = false; vramAddress = 0; tempAddress = 0;
+        addressLatch = false; v = 0; t = 0; fineX = 0;
+        scrollX = 0; scrollY = 0;
         cycle = 0; scanline = 0;
+    }
+
+    //Full power-on reset: everything reset() clears, plus VRAM/OAM/palette RAM and
+    //the read buffer/data bus - a real NES reset button leaves those alone, but the
+    //TAS Maker's "replay from power-on" seeking needs every repeated replay of the
+    //same input log to land on the exact same state, which requires starting from a
+    //truly blank PPU rather than whatever VRAM a previous replay happened to leave behind.
+    public void hardReset() {
+        reset();
+        java.util.Arrays.fill(nametables, (byte) 0);
+        java.util.Arrays.fill(paletteRam, (byte) 0);
+        java.util.Arrays.fill(oam, (byte) 0);
+        readBuffer = 0;
+        ppuDataBus = 0;
+        vblankStarted = false;
+        lastFrameHadHit = false;
+        hitOccurredThisFrame = false;
+    }
+
+    //World-space (512x480, matching NESDisplayPanel's tiled-nametable buffer) scroll
+    //position derived from the current v register + fine X: bit 10 of v is the
+    //horizontal nametable-select bit (which of the 2 world halves scrolling starts
+    //from), coarse X (bits 0-4) counts 8px tile steps within that half, fine X is the
+    //sub-tile pixel offset.
+    public int getWorldScrollX() {
+        int base = ((v & 0x0400) != 0) ? 256 : 0;
+        return (base + ((v & 0x001F) * 8) + fineX) & 0x1FF; //mod 512 (world width)
+    }
+
+    //Same idea vertically: bit 11 of v selects the world half, coarse Y (bits 5-9)
+    //counts 8px tile steps, fine Y (bits 12-14) is the sub-tile pixel offset.
+    public int getWorldScrollY() {
+        int base = ((v & 0x0800) != 0) ? 240 : 0;
+        int coarseY = (v >> 5) & 0x1F;
+        int fineY = (v >> 12) & 0x07;
+        return (base + coarseY * 8 + fineY) % 480; //mod 480 (world height)
     }
 
     public byte cpuRead(int address) {
         switch (address) {
-            case 0x2002: //PPUSTATUS
-                byte status = (byte) (ppustatus & 0xE0);
+            case 0x2002: //PPUSTATUS - only bits 5-7 are real; the rest are open bus
+                byte status = (byte) ((ppustatus & 0xE0) | (ppuDataBus & 0x1F));
                 ppustatus &= ~0x80; //Clear VBlank bit on read
                 addressLatch = false; //Reset address latch
+                ppuDataBus = status & 0xFF;
                 return status;
 
             case 0x2004: //OAMDATA
-                return oam[oamaddr & 0xFF];
+                ppuDataBus = oam[oamaddr & 0xFF] & 0xFF;
+                return (byte) ppuDataBus;
 
-            case 0x2007: //PPUDATA
+            case 0x2007: { //PPUDATA
                 byte data = readBuffer;
-                readBuffer = ppuRead(vramAddress);
+                readBuffer = ppuRead(v);
 
-                if (vramAddress >= 0x3F00) data = readBuffer; //Palette reads are unbuffered
+                if (v >= 0x3F00) data = (byte) ((readBuffer & 0x3F) | (ppuDataBus & 0xC0)); //Palette reads are unbuffered, upper 2 bits open bus
 
-                vramAddress += ((ppuctrl & 0x04) != 0) ? 32 : 1;
-                vramAddress &= 0x3FFF;
+                v += ((ppuctrl & 0x04) != 0) ? 32 : 1;
+                v &= 0x3FFF;
+                ppuDataBus = data & 0xFF;
                 return data;
+            }
 
-            default:
-                return 0;
+            default: //Write-only registers ($2000/$2001/$2003/$2005/$2006) are open bus
+                return (byte) ppuDataBus;
         }
     }
 
     public void cpuWrite(int address, byte data) {
         int val = data & 0xFF;
+        ppuDataBus = val;
         switch (address) {
             case 0x2000: //PPUCTRL
                 ppuctrl = val;
+                t = (t & 0xF3FF) | ((val & 0x03) << 10); //nametable-select bits into t
+                if (DEBUG_SPRITE0) System.out.printf("  [write $2000=%02x] scanline=%d cycle=%d%n", val, scanline, cycle);
                 break;
             case 0x2001: //PPUMASK
                 ppumask = val;
@@ -91,21 +187,51 @@ public class PPU {
                 oam[oamaddr & 0xFF] = data;
                 oamaddr = (oamaddr + 1) & 0xFF;
                 break;
+            case 0x2005: //PPUSCROLL
+                if (!addressLatch) {
+                    scrollX = val;
+                    t = (t & 0xFFE0) | ((val >> 3) & 0x1F); //coarse X
+                    fineX = val & 0x07;
+                    addressLatch = true;
+                    if (DEBUG_SPRITE0) System.out.printf("  [write $2005 X=%02x] scanline=%d cycle=%d%n", val, scanline, cycle);
+                } else {
+                    scrollY = val;
+                    t = (t & 0x8FFF) | ((val & 0x07) << 12); //fine Y
+                    t = (t & 0xFC1F) | ((val & 0xF8) << 2);  //coarse Y
+                    addressLatch = false;
+                }
+                break;
             case 0x2006: //PPUADDR
                 if (!addressLatch) {
-                    tempAddress = (tempAddress & 0x00FF) | ((val & 0x3F) << 8);
+                    t = (t & 0x00FF) | ((val & 0x3F) << 8);
                     addressLatch = true;
                 } else {
-                    tempAddress = (tempAddress & 0x7F00) | val;
-                    vramAddress = tempAddress;
+                    t = (t & 0x7F00) | val;
+                    v = t;
                     addressLatch = false;
                 }
                 break;
             case 0x2007: //PPUDATA
-                ppuWrite(vramAddress, data);
-                vramAddress += ((ppuctrl & 0x04) != 0) ? 32 : 1;
-                vramAddress &= 0x3FFF;
+                ppuWrite(v, data);
+                v += ((ppuctrl & 0x04) != 0) ? 32 : 1;
+                v &= 0x3FFF;
                 break;
+        }
+    }
+
+    //Non-mutating register peek for the memory inspector; avoids the read side-effects
+    //(VBlank clear, address latch reset, OAMDATA/PPUDATA auto-increment) that cpuRead triggers.
+    public byte debugRead(int address) {
+        switch (address & 0x0007) {
+            case 0: return (byte) ppuctrl;
+            case 1: return (byte) ppumask;
+            case 2: return (byte) ppustatus;
+            case 3: return (byte) oamaddr;
+            case 4: return oam[oamaddr & 0xFF];
+            case 5: return (byte) ppuscroll;
+            case 6: return (byte) ppuaddr;
+            case 7: return readBuffer;
+            default: return 0;
         }
     }
 
@@ -138,14 +264,63 @@ public class PPU {
         }
     }
 
-    //Advances PPU clock by 1 tick (3 PPU ticks per 1 CPU step)
-
+    //Advances PPU clock by 1 tick (3 PPU ticks per 1 CPU step). CPU and PPU are
+    //stepped 1:1 alongside each other (see NESEmulator.updateEmulationFrame), so at
+    //any point here the CPU has executed exactly up through this instant - nothing
+    //from "later" in the frame has happened yet.
+    //
+    //Visible pixels are produced one dot at a time (cycle 1 = pixel x=0 ... cycle 256
+    //= pixel x=255), matching real hardware's own cycle/scanline timing, instead of
+    //computing an entire scanline in one shot. This matters specifically for
+    //sprite-0-hit: games like SMB poll PPUSTATUS bit 6 and time a mid-frame $2005/$2000
+    //scroll write off *when* the hit fires within the scanline (it's used to split the
+    //status bar from the scrolling playfield). If the hit were set instantly at the
+    //start of the scanline instead of at the real x-position of the overlap, that write
+    //lands too early, desyncs the split permanently, and the CPU's poll loop for the
+    //next hit spins forever since the HUD sprite no longer overlaps opaque background.
+    //
+    //The v/t loopy-register copies below (cycle 257 horizontal, pre-render-line
+    //280-304 vertical) are what makes that split land correctly: a mid-scanline
+    //$2005/$2000 write only lands in t, so it can't retroactively affect the row
+    //currently being drawn - it only becomes visible in v (and therefore in
+    //getWorldScrollX/Y) once the real hardware moment for latching it arrives.
     public void step() {
         cycle++;
+
+        boolean renderingEnabled = (ppumask & 0x18) != 0;
+        boolean visibleOrPrerender = scanline <= 239 || scanline == 261;
+
+        if (scanline <= 239) {
+            if (cycle == 1) {
+                prepareScanline(scanline);
+            }
+            if (cycle >= 1 && cycle <= 256) {
+                renderPixel(scanline, cycle - 1);
+            }
+        }
+
+        //Note: unlike real hardware, v's Y bits are NOT incremented scanline-by-scanline
+        //here - renderPixel/prepareScanline instead compute each row's world Y by adding
+        //the current scanline number (sy) to the Y that getWorldScrollY() reads out of v
+        //(see prepareScanline). Only the horizontal copy matters every scanline (it's
+        //what lets a mid-frame $2005/$2000 X-scroll write - e.g. SMB's status-bar split -
+        //take effect starting the next scanline); the vertical copy only needs to happen
+        //once per frame, at the pre-render line, to (re)establish that per-frame Y
+        //baseline after the CPU's own $2006/$2007 VRAM housekeeping writes during VBlank
+        //have been moving v around for unrelated reasons.
+        if (renderingEnabled && visibleOrPrerender) {
+            if (cycle == 257) {
+                v = (v & ~0x041F) | (t & 0x041F); //horizontal bits: coarse X + NT-select X
+            }
+            if (scanline == 261 && cycle >= 280 && cycle <= 304) {
+                v = (v & ~0x7BE0) | (t & 0x7BE0); //vertical bits: fine/coarse Y + NT-select Y
+            }
+        }
+
         if (cycle >= 341) {
             cycle = 0;
             scanline++;
-            if (scanline >= 261) {
+            if (scanline >= 262) {
                 scanline = 0;
             }
         }
@@ -153,50 +328,194 @@ public class PPU {
         //Trigger VBlank at Scanline 241, Cycle 1
         if (scanline == 241 && cycle == 1) {
             ppustatus |= 0x80; //Set VBlank flag
+            vblankStarted = true;
+            lastFrameHadHit = hitOccurredThisFrame;
+            hitOccurredThisFrame = false;
+            ppustatus &= ~0x40; //Clear sprite-0-hit for the upcoming frame; renderScanline sets it live as the frame draws
             if ((ppuctrl & 0x80) != 0 && cpu != null) {
-                cpu.nmi(); //Trigger CPU NMI Interrupt
+                cpu.raiseNMI(); //Latch CPU NMI Interrupt; serviced at the next instruction boundary
             }
         }
 
         if (scanline == 261 && cycle == 1) {
-            ppustatus &=  ~0x80;
+            ppustatus &= ~0x80;
+
         }
     }
 
-    //Render background tiles into the 512x480 virtual screen space
-    public void renderToDisplay(NESDisplayPanel display) {
-        int bgTableOffset = ((ppuctrl & 0x10) != 0) ? 0x1000 : 0x0000;
+    //Per-scanline sprite state, evaluated once at cycle 1 (prepareScanline) and then
+    //consumed dot-by-dot by renderPixel as the beam actually advances across the row.
+    private static final int MAX_ROW_SPRITES = 8;
+    private final int[] rowSpriteIndex = new int[MAX_ROW_SPRITES];   //OAM index (0-63)
+    private final int[] rowSpriteX = new int[MAX_ROW_SPRITES];
+    private final int[] rowSpritePlane0 = new int[MAX_ROW_SPRITES];
+    private final int[] rowSpritePlane1 = new int[MAX_ROW_SPRITES];
+    private final boolean[] rowSpriteFlipH = new boolean[MAX_ROW_SPRITES];
+    private final boolean[] rowSpriteBehind = new boolean[MAX_ROW_SPRITES];
+    private final int[] rowSpritePaletteGroup = new int[MAX_ROW_SPRITES];
+    private int rowSpriteCount = 0;
+    private boolean rowShowBackground;
+    private boolean rowShowSprites;
+    private boolean rowShowLeftBackground;
+    private boolean rowShowLeftSprites;
+    private int rowBackdropRgb;
+    private int rowBgTableOffset;
+    private int rowWorldScrollX;
+    private int rowWorldScrollY;
 
-        for (int ntY = 0; ntY < 2; ntY++) {
-            for (int ntX = 0; ntX < 2; ntX++) {
-                int nametableIndex = (ntY * 2 + ntX) * 1024;
-                int startWorldX = ntX * 256;
-                int startWorldY = ntY * 240;
+    //Latches this scanline's render-affecting PPU state and evaluates sprites for the
+    //row (real hardware does this during cycles 65-256 of the *previous* scanline, but
+    //since nothing here reads OAM/PPUCTRL mid-evaluation, doing it up front at cycle 1
+    //of this scanline is behaviorally equivalent and simpler). Actual pixel output and
+    //the sprite-0-hit comparison happen later, dot-by-dot, in renderPixel.
+    private void prepareScanline(int sy) {
+        if (DEBUG_SPRITE0 && sy <= 35) {
+            System.out.printf("prepareScanline sy=%d ppuctrl=%02x scrollX=%d scrollY=%d%n", sy, ppuctrl, scrollX, scrollY);
+        }
+        rowShowBackground = (ppumask & 0x08) != 0;
+        rowShowSprites = (ppumask & 0x10) != 0;
+        rowShowLeftBackground = (ppumask & 0x02) != 0;
+        rowShowLeftSprites = (ppumask & 0x04) != 0;
 
-                for (int tileY = 0; tileY < 30; tileY++) {
-                    for (int tileX = 0; tileX < 32; tileX++) {
-                        int tileID = nametables[(nametableIndex + tileY * 32 + tileX) & 0x07FF] & 0xFF;
-                        int tileOffset = bgTableOffset + (tileID * 16);
+        rowBackdropRgb = NES_PALETTE[ppuRead(0x3F00) & 0x3F];
+        rowBgTableOffset = ((ppuctrl & 0x10) != 0) ? 0x1000 : 0x0000;
+        rowWorldScrollX = getWorldScrollX();
+        rowWorldScrollY = getWorldScrollY();
 
-                        //Decode 8x8 CHR tile bitplanes
-                        for (int py = 0; py < 8; py++) {
-                            byte plane0 = ppuRead(tileOffset + py);
-                            byte plane1 = ppuRead(tileOffset + py + 8);
+        rowSpriteCount = 0;
+        if (!rowShowSprites) return;
 
-                            for (int px = 0; px < 8; px++) {
-                                int bit0 = (plane0 >> (7 - px)) & 0x01;
-                                int bit1 = (plane1 >> (7 - px)) & 0x01;
-                                int pixelVal = (bit1 << 1) | bit0; //Pixel color index (0-3)
+        boolean tall = (ppuctrl & 0x20) != 0;
+        int spriteHeight = tall ? 16 : 8;
+        int spritePatternBase = ((ppuctrl & 0x08) != 0) ? 0x1000 : 0x0000;
 
-                                int paletteIndex = ppuRead(0x3F00 + pixelVal) & 0x3F;
-                                int rgb = NES_PALETTE[paletteIndex];
-
-                                display.setWorldPixel(startWorldX + tileX * 8 + px, startWorldY + tileY * 8 + py, rgb);
-                            }
-                        }
-                    }
-                }
+        //Real hardware evaluates OAM in index order and only has room for 8 sprites
+        //per scanline (the rest are simply dropped, causing the "flicker" games rely on
+        //when overcrowded) - matching that limit here keeps overcrowded scanlines from
+        //rendering sprites hardware wouldn't have room for either.
+        int[] matched = new int[8];
+        int matchCount = 0;
+        for (int i = 0; i < 64 && matchCount < 8; i++) {
+            int spriteTop = (oam[i * 4] & 0xFF) + 1;
+            if (sy >= spriteTop && sy < spriteTop + spriteHeight) {
+                matched[matchCount++] = i;
             }
         }
+
+        //Store in reverse of OAM-index order so index 0 ends up last in the row arrays
+        //(i.e. composited on top) - lower OAM index wins on overlapping opaque pixels,
+        //matching hardware priority.
+        for (int m = matchCount - 1; m >= 0; m--) {
+            int i = matched[m];
+            int base = i * 4;
+            int spriteTop = (oam[base] & 0xFF) + 1;
+            int tileIndex = oam[base + 1] & 0xFF;
+            int attr = oam[base + 2] & 0xFF;
+            int spriteX = oam[base + 3] & 0xFF;
+
+            boolean flipV = (attr & 0x80) != 0;
+            boolean flipH = (attr & 0x40) != 0;
+            boolean behindBackground = (attr & 0x20) != 0;
+            int paletteGroup = attr & 0x03;
+
+            int patternTableOffset = tall ? (((tileIndex & 0x01) != 0) ? 0x1000 : 0x0000) : spritePatternBase;
+            int tileNumber = tall ? (tileIndex & 0xFE) : tileIndex;
+
+            int row = sy - spriteTop;
+            int rowInTile = flipV ? (spriteHeight - 1 - row) : row;
+            int tileOffset;
+            if (tall) {
+                int half = rowInTile / 8;
+                int rowWithinHalf = rowInTile % 8;
+                tileOffset = patternTableOffset + ((tileNumber + half) * 16) + rowWithinHalf;
+            } else {
+                tileOffset = patternTableOffset + (tileNumber * 16) + rowInTile;
+            }
+
+            int n = rowSpriteCount++;
+            rowSpriteIndex[n] = i;
+            rowSpriteX[n] = spriteX;
+            rowSpritePlane0[n] = ppuRead(tileOffset) & 0xFF;
+            rowSpritePlane1[n] = ppuRead(tileOffset + 8) & 0xFF;
+            rowSpriteFlipH[n] = flipH;
+            rowSpriteBehind[n] = behindBackground;
+            rowSpritePaletteGroup[n] = paletteGroup;
+        }
+    }
+
+    //Renders one pixel of the current scanline - background then sprites, in real
+    //priority order - and, if this dot is where sprite 0's opaque pixel genuinely
+    //overlaps an opaque background pixel, sets the sprite-0-hit flag right here. Called
+    //once per PPU cycle for cycles 1-256 of each visible scanline (see step()), so the
+    //flag becomes visible to the CPU at the actual x-position of the hit rather than
+    //instantly at the start of the scanline - this is what lets games that time a
+    //mid-frame scroll write off the hit's position (e.g. SMB's status-bar split) work.
+    private void renderPixel(int sy, int x) {
+        int rgb;
+        boolean bgOpaque;
+        if (!rowShowBackground || (x < 8 && !rowShowLeftBackground)) {
+            rgb = rowBackdropRgb;
+            bgOpaque = false;
+        } else {
+            int worldX = (rowWorldScrollX + x) & 0x1FF;
+            int worldY = (rowWorldScrollY + sy) % 480;
+            int nametableIndex = ((worldY / 240) * 2 + (worldX / 256)) * 1024;
+            int tileX = (worldX % 256) / 8;
+            int tileY = (worldY % 240) / 8;
+            int px = worldX % 8;
+            int py = worldY % 8;
+
+            int tileID = nametables[(nametableIndex + tileY * 32 + tileX) & 0x07FF] & 0xFF;
+            int tileOffset = rowBgTableOffset + (tileID * 16);
+
+            //Attribute table: one byte per 4x4-tile (32x32px) block, 2 bits per 2x2-tile quadrant
+            int attrX = tileX / 4;
+            int attrY = tileY / 4;
+            int attrByte = nametables[(nametableIndex + 0x3C0 + attrY * 8 + attrX) & 0x07FF] & 0xFF;
+            int shift = ((tileY % 4) / 2) * 4 + ((tileX % 4) / 2) * 2;
+            int paletteGroup = (attrByte >> shift) & 0x03;
+
+            byte plane0 = ppuRead(tileOffset + py);
+            byte plane1 = ppuRead(tileOffset + py + 8);
+            int bit0 = (plane0 >> (7 - px)) & 0x01;
+            int bit1 = (plane1 >> (7 - px)) & 0x01;
+            int pixelVal = (bit1 << 1) | bit0;
+
+            int paletteIndex = (pixelVal == 0)
+                    ? (ppuRead(0x3F00) & 0x3F)
+                    : (ppuRead(0x3F00 + paletteGroup * 4 + pixelVal) & 0x3F);
+            rgb = NES_PALETTE[paletteIndex];
+            bgOpaque = pixelVal != 0;
+        }
+        if (rowSpriteCount > 0 && (x >= 8 || rowShowLeftSprites)) {
+            for (int n = 0; n < rowSpriteCount; n++) {
+                int col = x - rowSpriteX[n];
+                if (col < 0 || col > 7) continue;
+
+                int bitIndex = rowSpriteFlipH[n] ? col : (7 - col);
+                int bit0 = (rowSpritePlane0[n] >> bitIndex) & 0x01;
+                int bit1 = (rowSpritePlane1[n] >> bitIndex) & 0x01;
+                int pixelVal = (bit1 << 1) | bit0;
+                if (pixelVal == 0) continue; //transparent
+
+                //Real sprite-0-hit: never fires at x=255 (hardware quirk), and only
+                //when this is genuinely OAM slot 0 with both an opaque sprite pixel and
+                //an opaque background pixel actually landing on the same dot.
+                if (rowSpriteIndex[n] == 0 && bgOpaque && x != 255) {
+                    ppustatus |= 0x40;
+                    hitOccurredThisFrame = true;
+                }
+                if (DEBUG_SPRITE0 && rowSpriteIndex[n] == 0) {
+                    System.out.printf("sprite0 sy=%d x=%d pixelVal=%d bgHere=%b worldScrollX=%d%n", sy, x, pixelVal, bgOpaque, getWorldScrollX());
+                }
+
+                if (rowSpriteBehind[n] && bgOpaque) continue;
+
+                int paletteIndex = ppuRead(0x3F10 + rowSpritePaletteGroup[n] * 4 + pixelVal) & 0x3F;
+                rgb = NES_PALETTE[paletteIndex];
+            }
+        }
+
+        if (display != null) display.setPixel(x, sy, rgb);
     }
 }

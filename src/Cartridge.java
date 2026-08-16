@@ -81,4 +81,13 @@ public class Cartridge {
 
     public boolean isMirrorHorizontal() { return mirrorHorizontal; }
     public int getMapperID() { return mapperID; }
+
+    //Clears CHR RAM (if the cartridge has any) back to power-on zeroes. Used only by
+    //the TAS Maker's replay-from-power-on seeking, so repeated replays of the same
+    //input log are fully deterministic instead of depending on whatever a previous
+    //replay left in CHR RAM. CHR ROM carts have nothing to clear - PRG is already
+    //read-only so it never needs resetting either way.
+    public void hardReset() {
+        if (chrBanks == 0) java.util.Arrays.fill(chrMemory, (byte) 0);
+    }
 }
