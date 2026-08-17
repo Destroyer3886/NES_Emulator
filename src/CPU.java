@@ -24,6 +24,22 @@ public class CPU {
     private Bus bus;
     public long totalCycles = 0;
 
+    //Real hardware's DMC "put"/"get" cycle alternation is driven by a clock divider
+    //that free-runs from power-on and is NEVER resynced by the RESET line - only a
+    //true power cycle restarts it. totalCycles, by contrast, gets zeroed by reset()
+    //(a soft CPU reset - see Bus.reset(), used by both "load ROM" and the "Reset" menu
+    //item), which does NOT also reset APU (its apuCycleToggle free-runs the same way
+    //real hardware's divider does). If maybeStartDmcHalt() used totalCycles&1 for the
+    //2-vs-3 halt-cycle alignment decision, a soft reset partway through a run would
+    //desync it from the APU's own parity by however many cycles had elapsed before the
+    //reset - producing exactly the "sometimes crashes, sometimes fails error A"
+    //nondeterminism seen in AccuracyCoin's Interrupt Flag Latency tests 9/A/B (whose
+    //DMC DMA halt lands mid-branch-instruction and must fall on the correct alignment
+    //to avoid an extra/missing poll). This counter mirrors totalCycles's increments
+    //exactly but is deliberately never touched by reset(), so it stays correctly
+    //synced with the APU's free-running parity across any number of soft resets.
+    private long dmcParityCycles = 0;
+
     //Floating CPU data bus: latches the last byte value that actually appeared on the
     //bus, from either a read or a write. Reads from unmapped address ranges return
     //this latched value instead of a fixed 0, matching real hardware's "open bus".
@@ -61,6 +77,23 @@ public class CPU {
         latchedIrqPending = irqPending && !getFlag(I);
     }
 
+    //Branch-only variant for the cycle-4 poll (the one that only exists after a page
+    //crossing): ORs the fresh sample into whatever the cycle-2 poll already latched,
+    //instead of overwriting it. Real hardware's branch logic is the one documented
+    //exception where an interrupt detected on the earlier poll stays sticky even if
+    //the line was already cleared by the time of the later poll - see AccuracyCoin's
+    //Interrupt Flag Latency error code E. This must NOT be used for other multi-poll
+    //sequences (e.g. the BRK/IRQ/NMI push chain), where hijacking is decided by
+    //whichever poll happened last, not by OR-ing every poll in the sequence together
+    //(error code A/error code 2 territory).
+    private void pollInterruptsBranchSecond() {
+        boolean prevNmi = latchedNmiPending;
+        boolean prevIrq = latchedIrqPending;
+        pollInterrupts();
+        latchedNmiPending |= prevNmi;
+        latchedIrqPending |= prevIrq;
+    }
+
     //Cycles the CPU is stalled for (e.g. OAM DMA). Consumed one at a time by step(),
     //ahead of any interrupt polling or instruction dispatch, matching real hardware's
     //DMA cycle-stealing.
@@ -94,11 +127,40 @@ public class CPU {
     private boolean lastCycleWasWrite = false;
     private int lastBusAddress = 0;
 
+    //True whenever the ONE microOp currently sitting in the queue (self-extending
+    //sequencer, so there's never more than one pending at a time) will itself perform
+    //a write when it runs. Set by every write-producing enqueue site (enqueueFinal's
+    //WRITE/RMW cases, PHA/PHP, JSR/BRK/interrupt push cycles) right after they call
+    //microOps.add(); reset to false at the top of every stepInner() call so it always
+    //reflects only the cycle about to run. maybeStartDmcHalt() uses this (NOT
+    //lastCycleWasWrite, which reflects the cycle that just finished) to decide whether
+    //RDY is allowed to go low for the upcoming cycle - a write cycle always completes
+    //uninterrupted, so a DMC DMA request pending right before one must wait 1 more
+    //cycle. See AccuracyCoin's "DMA + $2007 Write" test for a case that specifically
+    //exercises this deferral.
+    private boolean pendingOpIsWrite = false;
+
     private boolean dmcDmaPending = false;
     private int dmcDmaAddress = 0;
 
+    //requestDmcDma() can be called mid-tick, from APU.clock() - which NESEmulator's
+    //main loop always calls BEFORE this same tick's cpu.step(). A request that shows
+    //up this way must NOT be able to halt THIS tick (the one whose op hasn't run
+    //yet): real hardware's RDY line is sampled at the start of each CPU cycle using
+    //whatever was asserted as of the END of the previous cycle, so the earliest a
+    //request can actually halt anything is the cycle AFTER the one it became known
+    //in. maybeStartDmcHalt() reads dmcDmaPendingVisible (updated once per step(),
+    //after that cycle's own op has already run) instead of dmcDmaPending directly, so
+    //a same-tick request is deferred exactly one cycle before it's eligible to halt.
+    //Without this, AccuracyCoin's Interrupt Flag Latency test A (a DMC DMA landing
+    //mid-branch-instruction) sees the IRQ one cycle too early - the halt swallows
+    //part of the branch's own operand-read cycle instead of only the cycle after it.
+    private boolean dmcDmaPendingVisible = false;
+
     private boolean dmcHalting = false;
     private int dmcHaltCyclesRemaining = 0;
+    //The address the halt's dummy reads target - see maybeStartDmcHalt()'s assignment.
+    private int dmcDummyReadAddr = 0;
 
     //Set for exactly one cycle: whether the microOp about to run is the first "real"
     //(non-stall) cycle following a completed DMC DMA halt. SHA/SHX/SHY/TAS's dummy
@@ -115,16 +177,63 @@ public class CPU {
         dmcDmaAddress = address;
     }
 
+    //Explicit DMA Abort: called from APU.Dmc.writeEnableFlag(false) whenever the DMC
+    //channel gets disabled, regardless of whether a DMA was actually in flight (a no-op
+    //otherwise). If the request hadn't started halting yet, it's simply withdrawn - no
+    //cycles were ever spent on it. If it's already mid-halt, the halt/alignment cycles
+    //already committed keep running (RDY was already asserted for their duration on real
+    //hardware), but the final "get" fetch cycle - the one that would actually read the
+    //sample byte - is dropped, since APU.Dmc.dmaCompleted() will now discard whatever
+    //value it's given anyway (bytesRemaining==0). Once a DMA has reached its actual get
+    //cycle it's too late to abort; runStallCycle() already checked !dmcHalting by then.
+    public void cancelDmcDma() {
+        //If a halt is already in progress, it's too late to un-spend those cycles - RDY
+        //was already asserted for their fixed duration on real hardware, so let the halt
+        //(including its final "get" read) run to completion as normal. That read still
+        //calls APU.dmcDmaCompleted(), which discards it harmlessly on its own (see
+        //Dmc.dmaCompleted()'s bytesRemaining==0 check, set by writeEnableFlag(false)
+        //just before this is called) - no separate abort notification needed there.
+        //
+        //Only a request that hasn't started halting yet needs cancelling here: it would
+        //otherwise sit in dmcDmaPending forever with nothing left to ever start its halt
+        //(bytesRemaining==0 means the APU will never re-request it), permanently
+        //blocking every future DMC DMA.
+        if (!dmcHalting && dmcDmaPending) {
+            dmcDmaPending = false;
+            dmcDmaPendingVisible = false;
+            if (apu != null) apu.dmcDmaAborted();
+        }
+    }
+
     //Called once per cycle, right after that cycle finished, to decide whether a
-    //pending DMC DMA request can start halting the CPU now.
+    //pending DMC DMA request can start halting the CPU now. Uses dmcDmaPendingVisible,
+    //NOT dmcDmaPending directly - see dmcDmaPendingVisible's declaration for why.
     private void maybeStartDmcHalt() {
-        if (!dmcDmaPending || lastCycleWasWrite) return;
+        if (!dmcDmaPendingVisible || pendingOpIsWrite) return;
+        dmcDmaPendingVisible = false;
         dmcDmaPending = false;
         dmcHalting = true;
         dmaHaltJustEnded = true;
+        //Real hardware's address bus is combinational: the address for the CPU's next
+        //(not-yet-executed) read cycle is already being driven onto the bus before RDY
+        //is even sampled, so a halt starting here freezes the bus at THAT pending
+        //target - not at the address of whatever the previous (already-completed)
+        //cycle read. The dummy reads during the halt are therefore re-reads of the
+        //pending cycle's own target address, which is exactly why they're able to
+        //(for example) clear $2002's VBlank flag, clock $4016, or increment the PPU's
+        //'v' register: AccuracyCoin's DMA+$2002/$2007/$4015/$4016 tests specifically
+        //sync the DMA to land right before such a read.
+        //microOps empty means the next thing is an opcode fetch (address = pc);
+        //otherwise a READ/WRITE/RMW instruction's effective address has already been
+        //resolved into addrAbs by the addressing-mode cycle that just ran (each
+        //beginRWM() case computes addrAbs and enqueues the final read/write/rmw cycle
+        //in the same CPU cycle), so addrAbs is exactly the pending cycle's target.
+        dmcDummyReadAddr = microOps.isEmpty() ? pc : addrAbs;
         //2 halt cycles always; a 3rd "alignment" cycle is needed unless the halt
         //happens to start already aligned to what would've been a natural read cycle.
-        dmcHaltCyclesRemaining = ((totalCycles & 1) == 0) ? 2 : 3;
+        //Uses dmcParityCycles, NOT totalCycles - see its declaration for why (soft
+        //reset desync).
+        dmcHaltCyclesRemaining = ((dmcParityCycles & 1) == 0) ? 2 : 3;
         stallCycles += dmcHaltCyclesRemaining + 1; //+1 for the final "get" cycle itself
     }
 
@@ -217,6 +326,7 @@ public class CPU {
         stallCycles = 0;
         oamDmaStall = false;
         dmcDmaPending = false;
+        dmcDmaPendingVisible = false;
         dmcHalting = false;
         dmcHaltCyclesRemaining = 0;
         lastCycleWasWrite = false;
@@ -229,6 +339,13 @@ public class CPU {
     //Edge-latched: PPU calls this once when it detects the VBlank NMI condition.
     public void raiseNMI() { nmiPending = true; }
 
+    //PPU calls this when $2002 is read at the exact PPU cycle the VBlank flag was
+    //set (see PPU.cpuRead's $2002 case) - this precisely-timed read race suppresses
+    //the NMI for this VBlank without affecting the flag itself (which the read's own
+    //caller already returns/clears normally). Only cancels a still-pending edge - if
+    //the CPU has already latched/consumed it (mid interrupt sequence), it's too late.
+    public void cancelPendingNMI() { nmiPending = false; }
+
     //Level-sensitive: held asserted for as long as any IRQ source (APU frame counter,
     //DMC) still wants it. The source is responsible for calling clearIRQ() only once
     //none of its own conditions are asserted anymore.
@@ -237,19 +354,22 @@ public class CPU {
 
     //Runs exactly one clock cycle. Matches the CPU-clock-per-call contract the rest
     //of the emulator already assumes (NESEmulator calls this once per real CPU cycle).
+    //Thin wrapper so every exit path from stepInner() passes through the same
+    //dmcDmaPendingVisible snapshot below, regardless of which of stepInner()'s several
+    //return points was taken.
     public void step(StringBuilder traceBuffer, PPU ppu, boolean tracingEnabled) {
+        stepInner(traceBuffer, ppu, tracingEnabled);
+        //Snapshot dmcDmaPending as of the END of this cycle, for maybeStartDmcHalt()
+        //to consult on the NEXT step() call - see dmcDmaPendingVisible's declaration.
+        dmcDmaPendingVisible = dmcDmaPending;
+    }
+
+    private void stepInner(StringBuilder traceBuffer, PPU ppu, boolean tracingEnabled) {
         if (stallCycles > 0) {
             runStallCycle();
             return;
         }
 
-        //A DMC DMA request that became known during this same tick's APU clock (APU is
-        //clocked before the CPU each cycle - see NESEmulator's main loop) can halt the CPU
-        //starting THIS cycle, exactly like real hardware's RDY line going low as early as
-        //possible. Checking here, before this cycle does any of its own work, is what lets
-        //the halt actually claim this cycle instead of leaving it as one extra "free" cycle
-        //before the halt begins (which is what happens if this check runs only at the end
-        //of step(), after the cycle's own work already happened).
         maybeStartDmcHalt();
         if (stallCycles > 0) {
             runStallCycle();
@@ -257,6 +377,7 @@ public class CPU {
         }
 
         lastCycleWasWrite = false;
+        pendingOpIsWrite = false;
         cycleFollowsDmcHalt = dmaHaltJustEnded;
         dmaHaltJustEnded = false;
 
@@ -280,6 +401,7 @@ public class CPU {
                 pc = (pc + 1) & 0xFFFF;
                 dispatch(opcode);
                 totalCycles++;
+                dmcParityCycles++;
                 return; //opcode fetch is itself the whole of this cycle; the micro-ops
                         //it just queued each get their own cycle on subsequent calls
             }
@@ -288,6 +410,7 @@ public class CPU {
         Runnable op = microOps.poll();
         if (op != null) op.run();
         totalCycles++;
+        dmcParityCycles++;
     }
 
     //Runs one cycle of an in-progress DMC DMA halt (or its final "get" fetch cycle).
@@ -298,7 +421,7 @@ public class CPU {
         if (dmcHalting) {
             if (dmcHaltCyclesRemaining > 0) {
                 dmcHaltCyclesRemaining--;
-                read(lastBusAddress); //dummy read: address bus is frozen while RDY is low
+                read(dmcDummyReadAddr); //dummy read of the pending cycle's own target address
             } else {
                 dmcHalting = false;
                 int value = read(dmcDmaAddress) & 0xFF; //the actual DMA "get" cycle
@@ -319,6 +442,7 @@ public class CPU {
             pollInterrupts();
         }
         totalCycles++;
+        dmcParityCycles++;
     }
 
     //---------------------------------------------------------------------
@@ -512,6 +636,7 @@ public class CPU {
                     }
                     write(addr, (byte) value);
                 });
+                pendingOpIsWrite = true;
                 break;
 
             case RMW:
@@ -524,7 +649,9 @@ public class CPU {
                             int result = op.rmwOp.run(fetched) & 0xFF;
                             write(addrAbs, (byte) result);
                         });
+                        pendingOpIsWrite = true;
                     });
+                    pendingOpIsWrite = true;
                 });
                 break;
 
@@ -557,6 +684,7 @@ public class CPU {
                 int[] vectorBox = {vector};
                 if (hijackable && pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
                 microOps.add(pushAndVectorFirst(vectorBox, false, hijackable));
+                pendingOpIsWrite = true;
             });
         });
     }
@@ -596,7 +724,9 @@ public class CPU {
                         });
                     });
                 });
+                pendingOpIsWrite = true;
             });
+            pendingOpIsWrite = true;
         };
     }
 
@@ -639,7 +769,7 @@ public class CPU {
 
                 if ((oldPc & 0xFF00) != (target & 0xFF00)) {
                     microOps.add(() -> {
-                        pollInterrupts(); //poll before cycle 4 (only exists if page crossed)
+                        pollInterruptsBranchSecond(); //poll before cycle 4 (only exists if page crossed)
                         read((oldPc & 0xFF00) | (target & 0xFF));
                     });
                 }
@@ -657,6 +787,7 @@ public class CPU {
             read(pc); //padding byte, discarded
             pc = (pc + 1) & 0xFFFF;
             microOps.add(pushAndVectorFirst(vectorBox, true, true));
+            pendingOpIsWrite = true;
         };
     }
 
@@ -678,7 +809,9 @@ public class CPU {
                             pc = (hi << 8) | lo;
                         });
                     });
+                    pendingOpIsWrite = true;
                 });
+                pendingOpIsWrite = true;
             });
         };
     }
@@ -738,6 +871,7 @@ public class CPU {
                 write(0x0100 + sp, (byte) a);
                 sp = (sp - 1) & 0xFF;
             });
+            pendingOpIsWrite = true;
         };
     }
 
@@ -749,6 +883,7 @@ public class CPU {
                 write(0x0100 + sp, (byte) (status | B | U));
                 sp = (sp - 1) & 0xFF;
             });
+            pendingOpIsWrite = true;
         };
     }
 
@@ -779,6 +914,12 @@ public class CPU {
                     pollInterrupts();
                     sp = (sp + 1) & 0xFF;
                     status = read(0x0100 + sp) & 0xFF;
+                    //The B flag has no physical flip-flop in the status register - it
+                    //only exists as a bit synthesized when status gets pushed (PHP: 1,
+                    //BRK: 1, IRQ/NMI: 0). Pulling a byte with bit 4 set must NOT leave
+                    //it latched in `status`, or it'll leak into every later BRK/IRQ/NMI
+                    //push until the next RTI (RTI already clears it below).
+                    status &= ~B;
                     setFlag(U, true);
                 });
             });

@@ -79,6 +79,38 @@ public class PPU {
     //hitting their "wait for VBlank" poll only right before the next NMI). Slicing the
     //trace log the same way means a frame's trace starts right after NMI, instead of
     //starting mid-VBlank and showing the wait-loop exit near the very end of the slice.
+    //The real NMI line is level-sensitive AND(VBlank flag, PPUCTRL bit 7) - the CPU's
+    //own NMI input is edge-sensitive on that line's 0->1 transition. Tracking only
+    //"did VBlank just start AND was NMI already enabled at that instant" (as this
+    //code used to) misses every other way that same transition can happen: enabling
+    //NMI via a $2000 write while the VBlank flag is already set (AccuracyCoin's "NMI
+    //Control" test 3), or disabling and re-enabling within the same VBlank (test 7).
+    //nmiLine mirrors the AND's last known value; updateNmiLine() re-evaluates it
+    //(and fires cpu.raiseNMI() on a 0->1 edge) from every place that can change either
+    //of its two inputs: VBlank set/clear (below) and PPUCTRL writes (cpuWrite).
+    private boolean nmiLine = false;
+    //Mirrors ppustatus's VBlank bit for NMI-line purposes only, but clears 1 PPU dot
+    //earlier than the CPU-visible $2002 bit (see the scanline==261,cycle==0 site below) -
+    //empirically matches AccuracyCoin's "NMI at VBlank End" expected results, which
+    //transition 1 dot earlier than "VBlank End"'s own $2002-read-based table despite
+    //both being calibrated to the same ~2273-cycle target.
+    private boolean nmiVblLevel = false;
+    private void updateNmiLine() {
+        boolean newLine = nmiVblLevel && ((ppuctrl & 0x80) != 0);
+        if (newLine && !nmiLine && cpu != null) cpu.raiseNMI();
+        nmiLine = newLine;
+    }
+
+    //Set when $2002 is read on the exact PPU cycle immediately preceding the one
+    //that would set the VBlank flag (scanline 241, cycle 0 - the CPU's own read
+    //always happens before this iteration's PPU ticks run, so "read here" means
+    //the read landed 1 PPU cycle ahead of the flag-set tick). Per AccuracyCoin's
+    //"VBlank Beginning" test (case A=4) and "NMI Suppression" test, a read that
+    //precisely straddles the flag-set tick this way suppresses the flag from being
+    //set at all for the rest of this VBlank - and since the NMI line is derived from
+    //the flag, that also means no NMI fires this frame.
+    private boolean suppressVblSet = false;
+
     private boolean vblankStarted = false;
     public boolean consumeVBlankStart() {
         boolean result = vblankStarted;
@@ -100,6 +132,7 @@ public class PPU {
         addressLatch = false; v = 0; t = 0; fineX = 0;
         scrollX = 0; scrollY = 0;
         cycle = 0; scanline = 0;
+        nmiLine = false;
     }
 
     //Full power-on reset: everything reset() clears, plus VRAM/OAM/palette RAM and
@@ -143,6 +176,10 @@ public class PPU {
             case 0x2002: //PPUSTATUS - only bits 5-7 are real; the rest are open bus
                 byte status = (byte) ((ppustatus & 0xE0) | (ppuDataBus & 0x1F));
                 ppustatus &= ~0x80; //Clear VBlank bit on read
+                nmiVblLevel = false;
+                if (scanline == 241 && cycle == 0) suppressVblSet = true; //see suppressVblSet's declaration
+                if (scanline == 241 && cycle == 1 && cpu != null) cpu.cancelPendingNMI(); //read races the flag-set tick: flag stands, but NMI is suppressed
+                updateNmiLine(); //a read-cleared VBlank flag can also drop the NMI line
                 addressLatch = false; //Reset address latch
                 ppuDataBus = status & 0xFF;
                 return status;
@@ -175,6 +212,7 @@ public class PPU {
             case 0x2000: //PPUCTRL
                 ppuctrl = val;
                 t = (t & 0xF3FF) | ((val & 0x03) << 10); //nametable-select bits into t
+                updateNmiLine(); //toggling bit 7 can raise (or drop) the NMI line immediately
                 if (DEBUG_SPRITE0) System.out.printf("  [write $2000=%02x] scanline=%d cycle=%d%n", val, scanline, cycle);
                 break;
             case 0x2001: //PPUMASK
@@ -284,8 +322,15 @@ public class PPU {
     //$2005/$2000 write only lands in t, so it can't retroactively affect the row
     //currently being drawn - it only becomes visible in v (and therefore in
     //getWorldScrollX/Y) once the real hardware moment for latching it arrives.
+    private boolean pendingVblNmiEdge = false;
+
     public void step() {
         cycle++;
+
+        if (pendingVblNmiEdge) {
+            pendingVblNmiEdge = false;
+            updateNmiLine();
+        }
 
         boolean renderingEnabled = (ppumask & 0x18) != 0;
         boolean visibleOrPrerender = scanline <= 239 || scanline == 261;
@@ -323,23 +368,31 @@ public class PPU {
             if (scanline >= 262) {
                 scanline = 0;
             }
+            //nmiVblLevel drops 1 PPU dot before the CPU-visible $2002 bit does (see
+            //nmiVblLevel's declaration) - right here, at scanline 261 dot 0, one dot
+            //ahead of the dot-1 clear below.
+            if (scanline == 261) {
+                nmiVblLevel = false;
+                updateNmiLine();
+            }
         }
 
         //Trigger VBlank at Scanline 241, Cycle 1
         if (scanline == 241 && cycle == 1) {
-            ppustatus |= 0x80; //Set VBlank flag
-            vblankStarted = true;
+            vblankStarted = true; //still marks "one frame elapsed" even when suppressed
             lastFrameHadHit = hitOccurredThisFrame;
             hitOccurredThisFrame = false;
             ppustatus &= ~0x40; //Clear sprite-0-hit for the upcoming frame; renderScanline sets it live as the frame draws
-            if ((ppuctrl & 0x80) != 0 && cpu != null) {
-                cpu.raiseNMI(); //Latch CPU NMI Interrupt; serviced at the next instruction boundary
+            if (!suppressVblSet) {
+                ppustatus |= 0x80; //Set VBlank flag
+                nmiVblLevel = true;
+                pendingVblNmiEdge = true; //the NMI-line's own rising edge lags the $2002-visible flag by 1 ppu dot
             }
+            suppressVblSet = false;
         }
 
         if (scanline == 261 && cycle == 1) {
             ppustatus &= ~0x80;
-
         }
     }
 

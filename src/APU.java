@@ -279,6 +279,10 @@ public class APU {
         boolean dmaPending;
         boolean irqFlag;
 
+        //Cycles left until a pending restart (see writeEnableFlag()) actually reloads
+        //currentAddress/bytesRemaining; 0 means no restart is pending.
+        int enableDelay = 0;
+
         void writeReg0(int val) {
             irqEnable = (val & 0x80) != 0;
             loop = (val & 0x40) != 0;
@@ -290,10 +294,31 @@ public class APU {
         void writeSampleAddress(int val) { sampleAddress = 0xC000 + (val * 64); }
         void writeSampleLength(int val) { sampleLength = (val * 16) + 1; }
 
-        void restart() {
-            currentAddress = sampleAddress;
-            bytesRemaining = sampleLength;
-            if (!bufferHasData) requestDma();
+        //$4015's DMC-enable bit doesn't restart a stopped sample the instant it's
+        //written - real hardware's restart takes effect 3 CPU cycles later (see
+        //AccuracyCoin's Delta Modulation Channel tests L/M/N: "The Delta Modulation
+        //Channel will be enabled in 3 CPU cycles"). The gating condition for whether
+        //a write restarts anything at all is bytesRemaining==0 - true both right after
+        //an explicit disable AND right after a non-looping sample plays out its last
+        //byte and fires its IRQ (dmaCompleted() leaves bytesRemaining at 0 in that
+        //case too) - NOT a separate persistent "was this channel ever enabled" latch;
+        //DMASync_TheGoodOne (and every AccuracyCoin test built on it) re-triggers this
+        //exact restart path many times over a run, each time relying on whatever
+        //sample was previously looping/playing having already reached bytesRemaining
+        //0 by then. While enableDelay counts down, bytesRemaining stays 0, so the
+        //ordinary "if (bytesRemaining>0) requestDma()" checks in clockTimer() below
+        //already retry every cycle for free once it's reloaded - no extra state needed.
+        void writeEnableFlag(boolean enable) {
+            if (!enable) {
+                bytesRemaining = 0;
+                enableDelay = 0;
+                //Explicit DMA Abort: disabling the channel while a DMA request is still
+                //pending or mid-halt on the CPU side must cancel it there too, not just
+                //here - see CPU.cancelDmcDma().
+                if (cpu != null) cpu.cancelDmcDma();
+            } else if (bytesRemaining == 0 && enableDelay == 0) {
+                enableDelay = 3;
+            }
         }
 
         void requestDma() {
@@ -304,6 +329,14 @@ public class APU {
 
         void dmaCompleted(int value) {
             dmaPending = false;
+            //If the channel was disabled (writeEnableFlag(false)) while this DMA was
+            //already in flight, bytesRemaining was forced to 0 out from under it - the
+            //fetched byte must be discarded rather than committed to the buffer/address
+            //counter, otherwise bytesRemaining-- below goes negative and permanently
+            //wedges the channel (writeEnableFlag(true)'s restart condition never sees
+            //bytesRemaining==0 again). See CPU.cancelDmcDma() for the matching CPU-side
+            //abort of the DMA's own halt cycles.
+            if (bytesRemaining == 0) return;
             bufferByte = value & 0xFF;
             bufferHasData = true;
             currentAddress = (currentAddress + 1) & 0xFFFF;
@@ -321,6 +354,18 @@ public class APU {
         }
 
         void clockTimer() {
+            //Runs every CPU cycle regardless of timerValue's phase - see
+            //writeEnableFlag() for why this delay exists and why no extra retry
+            //state is needed beyond the ordinary requestDma() calls below.
+            if (enableDelay > 0) {
+                enableDelay--;
+                if (enableDelay == 0) {
+                    currentAddress = sampleAddress;
+                    bytesRemaining = sampleLength;
+                    if (!bufferHasData) requestDma();
+                }
+            }
+
             if (timerValue == 0) {
                 //Unlike Pulse/Triangle's timerPeriod (a raw register value that's already
                 //"hardware period - 1" by convention, so this same reload-then-count-to-zero
@@ -492,6 +537,12 @@ public class APU {
     // CPU-facing DMC DMA callback
     //-----------------------------------------------------------------
     public void dmcDmaCompleted(int value) { dmc.dmaCompleted(value); }
+    //Called by CPU.cancelDmcDma() when an in-flight DMA gets explicitly aborted before
+    //reaching its "get" cycle - clears the pending-request latch WITHOUT touching the
+    //buffer/address/length state that dmaCompleted() would (there's no fetched byte to
+    //commit). Without this, dmaPending would stay stuck true forever, permanently
+    //deadlocking every future requestDma() call (which no-ops while dmaPending is set).
+    public void dmcDmaAborted() { dmc.dmaPending = false; }
 
     //-----------------------------------------------------------------
     // Register interface
@@ -559,12 +610,7 @@ public class APU {
                 noise.enabled = (val & 0x08) != 0;
                 if (!noise.enabled) noise.lengthCounter = 0;
 
-                boolean dmcEnable = (val & 0x10) != 0;
-                if (!dmcEnable) {
-                    dmc.bytesRemaining = 0;
-                } else if (dmc.bytesRemaining == 0) {
-                    dmc.restart();
-                }
+                dmc.writeEnableFlag((val & 0x10) != 0);
                 dmc.irqFlag = false;
                 updateIrqLine();
                 break;
