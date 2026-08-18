@@ -460,6 +460,192 @@ public class APU {
         }
     }
 
+    //TAS Maker greenzone checkpoint support - see CPU.State's comment for why this is
+    //only ever captured/restored at a CPU instruction boundary. One static holder
+    //class per channel (Envelope is embedded directly into whichever channel owns it,
+    //matching the live object graph) rather than one flat field list, since Pulse1/
+    //Pulse2/Noise each carry their own Envelope instance.
+    public static final class EnvelopeState {
+        boolean loop, constantVolume;
+        int volume;
+        boolean start;
+        int divider, decay;
+    }
+    private static EnvelopeState snapshotEnvelope(Envelope e) {
+        EnvelopeState s = new EnvelopeState();
+        s.loop = e.loop; s.constantVolume = e.constantVolume; s.volume = e.volume;
+        s.start = e.start; s.divider = e.divider; s.decay = e.decay;
+        return s;
+    }
+    private static void restoreEnvelope(Envelope e, EnvelopeState s) {
+        e.loop = s.loop; e.constantVolume = s.constantVolume; e.volume = s.volume;
+        e.start = s.start; e.divider = s.divider; e.decay = s.decay;
+    }
+
+    public static final class PulseState {
+        boolean enabled;
+        int duty;
+        boolean lengthHalt;
+        EnvelopeState envelope;
+        boolean sweepEnabled, sweepNegate, sweepReload;
+        int sweepPeriod, sweepShift, sweepDivider;
+        int timerPeriod, timerValue, sequencePos;
+        int lengthCounter;
+    }
+    private static PulseState snapshotPulse(Pulse p) {
+        PulseState s = new PulseState();
+        s.enabled = p.enabled; s.duty = p.duty; s.lengthHalt = p.lengthHalt;
+        s.envelope = snapshotEnvelope(p.envelope);
+        s.sweepEnabled = p.sweepEnabled; s.sweepNegate = p.sweepNegate; s.sweepReload = p.sweepReload;
+        s.sweepPeriod = p.sweepPeriod; s.sweepShift = p.sweepShift; s.sweepDivider = p.sweepDivider;
+        s.timerPeriod = p.timerPeriod; s.timerValue = p.timerValue; s.sequencePos = p.sequencePos;
+        s.lengthCounter = p.lengthCounter;
+        return s;
+    }
+    private static void restorePulse(Pulse p, PulseState s) {
+        p.enabled = s.enabled; p.duty = s.duty; p.lengthHalt = s.lengthHalt;
+        restoreEnvelope(p.envelope, s.envelope);
+        p.sweepEnabled = s.sweepEnabled; p.sweepNegate = s.sweepNegate; p.sweepReload = s.sweepReload;
+        p.sweepPeriod = s.sweepPeriod; p.sweepShift = s.sweepShift; p.sweepDivider = s.sweepDivider;
+        p.timerPeriod = s.timerPeriod; p.timerValue = s.timerValue; p.sequencePos = s.sequencePos;
+        p.lengthCounter = s.lengthCounter;
+    }
+
+    public static final class TriangleState {
+        boolean enabled, controlFlag;
+        int linearReloadValue;
+        boolean linearReloadFlag;
+        int linearCounter;
+        int timerPeriod, timerValue, sequencePos;
+        int lengthCounter;
+    }
+    private static TriangleState snapshotTriangle(Triangle t) {
+        TriangleState s = new TriangleState();
+        s.enabled = t.enabled; s.controlFlag = t.controlFlag;
+        s.linearReloadValue = t.linearReloadValue; s.linearReloadFlag = t.linearReloadFlag;
+        s.linearCounter = t.linearCounter;
+        s.timerPeriod = t.timerPeriod; s.timerValue = t.timerValue; s.sequencePos = t.sequencePos;
+        s.lengthCounter = t.lengthCounter;
+        return s;
+    }
+    private static void restoreTriangle(Triangle t, TriangleState s) {
+        t.enabled = s.enabled; t.controlFlag = s.controlFlag;
+        t.linearReloadValue = s.linearReloadValue; t.linearReloadFlag = s.linearReloadFlag;
+        t.linearCounter = s.linearCounter;
+        t.timerPeriod = s.timerPeriod; t.timerValue = s.timerValue; t.sequencePos = s.sequencePos;
+        t.lengthCounter = s.lengthCounter;
+    }
+
+    public static final class NoiseState {
+        boolean enabled, lengthHalt;
+        EnvelopeState envelope;
+        boolean mode;
+        int periodIndex, timerValue, shiftRegister, lengthCounter;
+    }
+    private static NoiseState snapshotNoise(Noise n) {
+        NoiseState s = new NoiseState();
+        s.enabled = n.enabled; s.lengthHalt = n.lengthHalt;
+        s.envelope = snapshotEnvelope(n.envelope);
+        s.mode = n.mode;
+        s.periodIndex = n.periodIndex; s.timerValue = n.timerValue;
+        s.shiftRegister = n.shiftRegister; s.lengthCounter = n.lengthCounter;
+        return s;
+    }
+    private static void restoreNoise(Noise n, NoiseState s) {
+        n.enabled = s.enabled; n.lengthHalt = s.lengthHalt;
+        restoreEnvelope(n.envelope, s.envelope);
+        n.mode = s.mode;
+        n.periodIndex = s.periodIndex; n.timerValue = s.timerValue;
+        n.shiftRegister = s.shiftRegister; n.lengthCounter = s.lengthCounter;
+    }
+
+    public static final class DmcState {
+        boolean irqEnable, loop;
+        int rateIndex, outputLevel;
+        int sampleAddress, sampleLength;
+        int currentAddress, bytesRemaining;
+        int timerValue;
+        boolean bufferHasData;
+        int bufferByte;
+        boolean silence;
+        int shiftRegister, bitsRemaining;
+        boolean dmaPending, irqFlag;
+        int enableDelay;
+        int naturalEndGraceCycles;
+    }
+    private static DmcState snapshotDmc(Dmc d) {
+        DmcState s = new DmcState();
+        s.irqEnable = d.irqEnable; s.loop = d.loop;
+        s.rateIndex = d.rateIndex; s.outputLevel = d.outputLevel;
+        s.sampleAddress = d.sampleAddress; s.sampleLength = d.sampleLength;
+        s.currentAddress = d.currentAddress; s.bytesRemaining = d.bytesRemaining;
+        s.timerValue = d.timerValue;
+        s.bufferHasData = d.bufferHasData;
+        s.bufferByte = d.bufferByte;
+        s.silence = d.silence;
+        s.shiftRegister = d.shiftRegister; s.bitsRemaining = d.bitsRemaining;
+        s.dmaPending = d.dmaPending; s.irqFlag = d.irqFlag;
+        s.enableDelay = d.enableDelay;
+        s.naturalEndGraceCycles = d.naturalEndGraceCycles;
+        return s;
+    }
+    private static void restoreDmc(Dmc d, DmcState s) {
+        d.irqEnable = s.irqEnable; d.loop = s.loop;
+        d.rateIndex = s.rateIndex; d.outputLevel = s.outputLevel;
+        d.sampleAddress = s.sampleAddress; d.sampleLength = s.sampleLength;
+        d.currentAddress = s.currentAddress; d.bytesRemaining = s.bytesRemaining;
+        d.timerValue = s.timerValue;
+        d.bufferHasData = s.bufferHasData;
+        d.bufferByte = s.bufferByte;
+        d.silence = s.silence;
+        d.shiftRegister = s.shiftRegister; d.bitsRemaining = s.bitsRemaining;
+        d.dmaPending = s.dmaPending; d.irqFlag = s.irqFlag;
+        d.enableDelay = s.enableDelay;
+        d.naturalEndGraceCycles = s.naturalEndGraceCycles;
+    }
+
+    public static final class State {
+        double sampleCycleAccumulator, outputAccum;
+        int outputCount;
+        boolean fiveStepMode, irqInhibit, frameIrqFlag;
+        int frameCycle, resetDelay;
+        boolean apuCycleToggle;
+        PulseState pulse1, pulse2;
+        TriangleState triangle;
+        NoiseState noise;
+        DmcState dmc;
+    }
+
+    public State snapshot() {
+        State s = new State();
+        s.sampleCycleAccumulator = sampleCycleAccumulator;
+        s.outputAccum = outputAccum;
+        s.outputCount = outputCount;
+        s.fiveStepMode = fiveStepMode; s.irqInhibit = irqInhibit; s.frameIrqFlag = frameIrqFlag;
+        s.frameCycle = frameCycle; s.resetDelay = resetDelay;
+        s.apuCycleToggle = apuCycleToggle;
+        s.pulse1 = snapshotPulse(pulse1);
+        s.pulse2 = snapshotPulse(pulse2);
+        s.triangle = snapshotTriangle(triangle);
+        s.noise = snapshotNoise(noise);
+        s.dmc = snapshotDmc(dmc);
+        return s;
+    }
+
+    public void restore(State s) {
+        sampleCycleAccumulator = s.sampleCycleAccumulator;
+        outputAccum = s.outputAccum;
+        outputCount = s.outputCount;
+        fiveStepMode = s.fiveStepMode; irqInhibit = s.irqInhibit; frameIrqFlag = s.frameIrqFlag;
+        frameCycle = s.frameCycle; resetDelay = s.resetDelay;
+        apuCycleToggle = s.apuCycleToggle;
+        restorePulse(pulse1, s.pulse1);
+        restorePulse(pulse2, s.pulse2);
+        restoreTriangle(triangle, s.triangle);
+        restoreNoise(noise, s.noise);
+        restoreDmc(dmc, s.dmc);
+    }
+
     private Pulse pulse1 = new Pulse(true);
     private Pulse pulse2 = new Pulse(false);
     private Triangle triangle = new Triangle();

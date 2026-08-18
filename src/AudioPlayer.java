@@ -36,6 +36,10 @@ public class AudioPlayer {
     private volatile boolean muted = false;
     private Thread playbackThread;
     private SourceDataLine line;
+    //Guards every direct call into the SourceDataLine (write/stop/flush/start) so
+    //flush() can't race the playback thread's write() - see flush()'s comment for why
+    //that race is exactly what caused audio to stack up and loop on Windows.
+    private final Object lineLock = new Object();
 
     private double prevInput = 0.0;
     private double prevOutput = 0.0;
@@ -71,11 +75,13 @@ public class AudioPlayer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        if (line != null) {
-            line.drain();
-            line.stop();
-            line.close();
-            line = null;
+        synchronized (lineLock) {
+            if (line != null) {
+                line.drain();
+                line.stop();
+                line.close();
+                line = null;
+            }
         }
     }
 
@@ -98,7 +104,9 @@ public class AudioPlayer {
                 available -= count;
                 ringLock.notifyAll();
             }
-            line.write(chunk, 0, count);
+            synchronized (lineLock) {
+                if (running) line.write(chunk, 0, count);
+            }
         }
     }
 
@@ -120,12 +128,29 @@ public class AudioPlayer {
         if (muted && !wasMuted) flush();
     }
 
-    //Discards whatever's currently queued for playback without stopping the line.
+    //Discards whatever's currently queued for playback. Clearing the software ring
+    //buffer alone isn't enough - any bytes already handed to line.write() are sitting
+    //in the SourceDataLine's own internal/device buffer, outside our control, and
+    //clearing the ring does nothing to them. On Windows, once that leftover audio
+    //finishes playing, some DirectSound-backed lines don't just go silent when
+    //starved of new data - they repeat the last buffer they were given, which is
+    //exactly what made audio "stack up" and loop forever after a burst of quick
+    //scrubbing. SourceDataLine.flush() is documented to give predictable results only
+    //while stopped, so bracket it with stop()/start() rather than calling it on a
+    //running line - and hold lineLock throughout so this can't interleave with the
+    //playback thread's own line.write() call.
     public void flush() {
         synchronized (ringLock) {
             available = 0;
             readPos = writePos;
             ringLock.notifyAll();
+        }
+        synchronized (lineLock) {
+            if (line != null) {
+                line.stop();
+                line.flush();
+                line.start();
+            }
         }
     }
 

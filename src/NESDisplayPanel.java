@@ -37,6 +37,20 @@ public class NESDisplayPanel extends JPanel {
         repaint();
     }
 
+    //TAS Maker greenzone support: a restored checkpoint's CPU/PPU/APU/Bus state does
+    //NOT touch these pixels (they live here, not in Bus.EmulatorState), so landing
+    //exactly on a checkpoint with no replay needed would otherwise leave the display
+    //showing whatever frame was on screen before the seek. Capture/restore this buffer
+    //alongside each checkpoint so scrubbing to an exact checkpoint still updates the
+    //visible screen.
+    public int[] snapshotPixels() {
+        return screenPixels.clone();
+    }
+
+    public void restorePixels(int[] pixels) {
+        System.arraycopy(pixels, 0, screenPixels, 0, screenPixels.length);
+    }
+
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);

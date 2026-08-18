@@ -152,6 +152,90 @@ public class PPU {
         hitOccurredThisFrame = false;
     }
 
+    //TAS Maker greenzone checkpoint support - see CPU.State's comment for why this is
+    //only ever captured/restored at a CPU instruction boundary. The row* fields are
+    //transient per-scanline rendering scratch (recomputed at the start of each
+    //scanline before use), so they're technically redundant to snapshot, but they're
+    //cheap (8-element arrays) and capturing them anyway avoids relying on that being
+    //true forever as rendering code changes.
+    public static final class State {
+        byte[] nametables, paletteRam, oam;
+        int ppuctrl, ppumask, ppustatus, oamaddr, oamdata, ppuscroll, ppuaddr, ppudata;
+        boolean addressLatch;
+        int v, t, fineX;
+        byte readBuffer;
+        int ppuDataBus;
+        int scrollX, scrollY;
+        int cycle, scanline;
+        boolean lastFrameHadHit, hitOccurredThisFrame;
+        boolean nmiLine, nmiVblLevel, suppressVblSet, vblankStarted, pendingVblNmiEdge;
+        int[] rowSpriteX, rowSpritePlane0, rowSpritePlane1, rowSpritePaletteGroup;
+        boolean[] rowSpriteFlipH, rowSpriteBehind;
+        int rowSpriteCount;
+        boolean rowShowBackground, rowShowSprites, rowShowLeftBackground, rowShowLeftSprites;
+        int rowBackdropRgb, rowBgTableOffset, rowWorldScrollX, rowWorldScrollY;
+    }
+
+    public State snapshot() {
+        State s = new State();
+        s.nametables = nametables.clone();
+        s.paletteRam = paletteRam.clone();
+        s.oam = oam.clone();
+        s.ppuctrl = ppuctrl; s.ppumask = ppumask; s.ppustatus = ppustatus;
+        s.oamaddr = oamaddr; s.oamdata = oamdata; s.ppuscroll = ppuscroll;
+        s.ppuaddr = ppuaddr; s.ppudata = ppudata;
+        s.addressLatch = addressLatch;
+        s.v = v; s.t = t; s.fineX = fineX;
+        s.readBuffer = readBuffer;
+        s.ppuDataBus = ppuDataBus;
+        s.scrollX = scrollX; s.scrollY = scrollY;
+        s.cycle = cycle; s.scanline = scanline;
+        s.lastFrameHadHit = lastFrameHadHit; s.hitOccurredThisFrame = hitOccurredThisFrame;
+        s.nmiLine = nmiLine; s.nmiVblLevel = nmiVblLevel; s.suppressVblSet = suppressVblSet;
+        s.vblankStarted = vblankStarted; s.pendingVblNmiEdge = pendingVblNmiEdge;
+        s.rowSpriteX = rowSpriteX.clone();
+        s.rowSpritePlane0 = rowSpritePlane0.clone();
+        s.rowSpritePlane1 = rowSpritePlane1.clone();
+        s.rowSpritePaletteGroup = rowSpritePaletteGroup.clone();
+        s.rowSpriteFlipH = rowSpriteFlipH.clone();
+        s.rowSpriteBehind = rowSpriteBehind.clone();
+        s.rowSpriteCount = rowSpriteCount;
+        s.rowShowBackground = rowShowBackground; s.rowShowSprites = rowShowSprites;
+        s.rowShowLeftBackground = rowShowLeftBackground; s.rowShowLeftSprites = rowShowLeftSprites;
+        s.rowBackdropRgb = rowBackdropRgb; s.rowBgTableOffset = rowBgTableOffset;
+        s.rowWorldScrollX = rowWorldScrollX; s.rowWorldScrollY = rowWorldScrollY;
+        return s;
+    }
+
+    public void restore(State s) {
+        System.arraycopy(s.nametables, 0, nametables, 0, nametables.length);
+        System.arraycopy(s.paletteRam, 0, paletteRam, 0, paletteRam.length);
+        System.arraycopy(s.oam, 0, oam, 0, oam.length);
+        ppuctrl = s.ppuctrl; ppumask = s.ppumask; ppustatus = s.ppustatus;
+        oamaddr = s.oamaddr; oamdata = s.oamdata; ppuscroll = s.ppuscroll;
+        ppuaddr = s.ppuaddr; ppudata = s.ppudata;
+        addressLatch = s.addressLatch;
+        v = s.v; t = s.t; fineX = s.fineX;
+        readBuffer = s.readBuffer;
+        ppuDataBus = s.ppuDataBus;
+        scrollX = s.scrollX; scrollY = s.scrollY;
+        cycle = s.cycle; scanline = s.scanline;
+        lastFrameHadHit = s.lastFrameHadHit; hitOccurredThisFrame = s.hitOccurredThisFrame;
+        nmiLine = s.nmiLine; nmiVblLevel = s.nmiVblLevel; suppressVblSet = s.suppressVblSet;
+        vblankStarted = s.vblankStarted; pendingVblNmiEdge = s.pendingVblNmiEdge;
+        System.arraycopy(s.rowSpriteX, 0, rowSpriteX, 0, rowSpriteX.length);
+        System.arraycopy(s.rowSpritePlane0, 0, rowSpritePlane0, 0, rowSpritePlane0.length);
+        System.arraycopy(s.rowSpritePlane1, 0, rowSpritePlane1, 0, rowSpritePlane1.length);
+        System.arraycopy(s.rowSpritePaletteGroup, 0, rowSpritePaletteGroup, 0, rowSpritePaletteGroup.length);
+        System.arraycopy(s.rowSpriteFlipH, 0, rowSpriteFlipH, 0, rowSpriteFlipH.length);
+        System.arraycopy(s.rowSpriteBehind, 0, rowSpriteBehind, 0, rowSpriteBehind.length);
+        rowSpriteCount = s.rowSpriteCount;
+        rowShowBackground = s.rowShowBackground; rowShowSprites = s.rowShowSprites;
+        rowShowLeftBackground = s.rowShowLeftBackground; rowShowLeftSprites = s.rowShowLeftSprites;
+        rowBackdropRgb = s.rowBackdropRgb; rowBgTableOffset = s.rowBgTableOffset;
+        rowWorldScrollX = s.rowWorldScrollX; rowWorldScrollY = s.rowWorldScrollY;
+    }
+
     //World-space (512x480, matching NESDisplayPanel's tiled-nametable buffer) scroll
     //position derived from the current v register + fine X: bit 10 of v is the
     //horizontal nametable-select bit (which of the 2 world halves scrolling starts

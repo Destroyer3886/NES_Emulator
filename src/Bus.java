@@ -198,6 +198,47 @@ public class Bus {
         if (cpu != null) cpu.startOamDma(page);
     }
 
+    //TAS Maker greenzone checkpoint support: one composite snapshot of the whole
+    //machine (CPU + PPU + APU + Bus's own RAM/controller-shift state + cartridge CHR
+    //RAM), so the TAS Maker only has to hold one object per checkpointed frame. Only
+    //ever captured at a CPU instruction boundary - see CPU.State's comment for why.
+    public static final class EmulatorState {
+        CPU.State cpu;
+        PPU.State ppu;
+        APU.State apu;
+        byte[] ram;
+        byte[] chr;
+        int controller1, controller2, controller1Shift, controller2Shift;
+        boolean controllerStrobe;
+        boolean strobedThisFrame;
+    }
+
+    public EmulatorState snapshot() {
+        EmulatorState s = new EmulatorState();
+        s.cpu = cpu.snapshot();
+        s.ppu = ppu.snapshot();
+        s.apu = apu.snapshot();
+        s.ram = ram.clone();
+        s.chr = cartridge != null ? cartridge.snapshotChr() : null;
+        s.controller1 = controller1; s.controller2 = controller2;
+        s.controller1Shift = controller1Shift; s.controller2Shift = controller2Shift;
+        s.controllerStrobe = controllerStrobe;
+        s.strobedThisFrame = strobedThisFrame;
+        return s;
+    }
+
+    public void restore(EmulatorState s) {
+        cpu.restore(s.cpu);
+        ppu.restore(s.ppu);
+        apu.restore(s.apu);
+        System.arraycopy(s.ram, 0, ram, 0, ram.length);
+        if (cartridge != null && s.chr != null) cartridge.restoreChr(s.chr);
+        controller1 = s.controller1; controller2 = s.controller2;
+        controller1Shift = s.controller1Shift; controller2Shift = s.controller2Shift;
+        controllerStrobe = s.controllerStrobe;
+        strobedThisFrame = s.strobedThisFrame;
+    }
+
     public byte ppuReadCartridge(int address) {
         if (cartridge != null) return cartridge.ppuRead(address);
         return 0;

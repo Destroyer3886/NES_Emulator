@@ -90,4 +90,11 @@ public class Cartridge {
     public void hardReset() {
         if (chrBanks == 0) java.util.Arrays.fill(chrMemory, (byte) 0);
     }
+
+    //TAS Maker greenzone checkpoint support. prgMemory/mapperID/prgBanks/chrBanks/
+    //mirrorHorizontal are never mutated after load (NROM is the only mapper this
+    //emulator supports, so there's no bank-switching register state), so only
+    //chrMemory - CHR RAM, when the cart has no CHR ROM - actually needs capturing.
+    public byte[] snapshotChr() { return chrMemory.clone(); }
+    public void restoreChr(byte[] chr) { System.arraycopy(chr, 0, chrMemory, 0, chrMemory.length); }
 }

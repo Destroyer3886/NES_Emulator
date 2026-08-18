@@ -12,6 +12,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.TreeMap;
 public class NESEmulator extends JFrame implements Runnable {
 
     private final NESDisplayPanel displayPanel;
@@ -55,6 +56,10 @@ public class NESEmulator extends JFrame implements Runnable {
     //that's what keeps the view from flickering or losing scroll position.
     private final int[] memorySnapshot = new int[65536];
 
+    //Debug viewer windows
+    private NametableViewerDialog nametableViewerDialog;
+    private PPUInspectorDialog ppuInspectorDialog;
+
     //TAS Maker Window Components
     private JDialog tasDialog;
     private JTable tasTable;
@@ -90,6 +95,35 @@ public class NESEmulator extends JFrame implements Runnable {
     //produced it runs. A validated frame with no strobe is a "lag frame" - the game
     //never polled input that frame - which is what the red/green coloring surfaces.
     private final List<Boolean> tasFrameStrobed = new ArrayList<>();
+    //Greenzone checkpoints: full emulator snapshots keyed by "executed frame count"
+    //(the same units as tasFrame/tasValidFrontier - a key of K means "state right
+    //after frames 0..K-1 have executed"), captured on a fixed grid anchored at frame
+    //0 (keys 0, N, 2N, ... where N is tasSavestateInterval) so seekToFrame can
+    //restore the nearest one at/below a target instead of always replaying from
+    //power-on. TreeMap so seekToFrame can cheaply find the largest key <= target via
+    //floorKey. Frame 0 itself never needs an entry - bus.hardReset() already gives
+    //that state for free. See maybeCaptureTasCheckpoint() for how/when entries are
+    //added, and invalidateTasCheckpointsFrom() for how edits/inserts drop stale ones.
+    private final TreeMap<Integer, TasCheckpoint> tasCheckpoints = new TreeMap<>();
+    //Pairs a machine-state checkpoint with the display pixels that were on screen at
+    //that instant - Bus.EmulatorState covers CPU/PPU/APU/Bus/cartridge, but the
+    //visible framebuffer lives in NESDisplayPanel, not the PPU, so it has to be
+    //captured/restored separately or an exact-checkpoint seek (no replay needed)
+    //would leave the old frame on screen.
+    private static final class TasCheckpoint {
+        final Bus.EmulatorState state;
+        final int[] pixels;
+        TasCheckpoint(Bus.EmulatorState state, int[] pixels) {
+            this.state = state;
+            this.pixels = pixels;
+        }
+    }
+    //"Frames per savestate" setting - see createTasSettingsDialog(). Every frame
+    //count that's a multiple of this becomes a checkpoint grid point. 1 means every
+    //single frame gets a checkpoint (fastest scrubbing, most memory); higher values
+    //trade memory for a longer worst-case replay-to-target after a backward seek.
+    private int tasSavestateInterval = 1;
+    private JDialog tasSettingsDialog;
 
     public NESEmulator() {
         super("NESEmulator");
@@ -112,6 +146,9 @@ public class NESEmulator extends JFrame implements Runnable {
 
         displayPanel = new NESDisplayPanel();
         ppu.connectDisplay(displayPanel);
+
+        nametableViewerDialog = new NametableViewerDialog(this, ppu);
+        ppuInspectorDialog = new PPUInspectorDialog(this, ppu);
 
         setJMenuBar(createMenuBar());
         setLayout(new BorderLayout());
@@ -383,6 +420,10 @@ public class NESEmulator extends JFrame implements Runnable {
         loadButton.addActionListener(e -> loadTas());
         topPanel.add(loadButton);
 
+        JButton settingsButton = new JButton("Settings...");
+        settingsButton.addActionListener(e -> openTasSettingsDialog());
+        topPanel.add(settingsButton);
+
         tasTableModel = new TasTableModel();
         //Overriding changeSelection to ignore anything outside column 0 is what keeps
         //a click/drag on a button cell from ALSO moving the seek playhead - only the
@@ -504,6 +545,62 @@ public class NESEmulator extends JFrame implements Runnable {
         tasPlayTimer = new javax.swing.Timer(1000 / 60, e -> tasAdvanceOneFrame());
     }
 
+    //Extensible TAS Maker settings dialog: each setting is one row added via
+    //addIntSetting (or a similar helper for future setting types) onto a simple
+    //vertical GridBagLayout list, so adding another setting later is just another
+    //call here rather than a bespoke layout. Built lazily/once and just re-shown -
+    //its controls always reflect live field values since there's nothing else that
+    //can change tasSavestateInterval out from under it.
+    private void createTasSettingsDialog() {
+        tasSettingsDialog = new JDialog(tasDialog, "TAS Maker Settings", false);
+        tasSettingsDialog.setLayout(new BorderLayout());
+
+        JPanel settingsPanel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(6, 8, 6, 8);
+        gbc.gridx = 0;
+        gbc.gridy = 0;
+        gbc.anchor = GridBagConstraints.WEST;
+
+        addIntSetting(settingsPanel, gbc, "Frames per savestate:", 1, 3600,
+                () -> tasSavestateInterval,
+                v -> tasSavestateInterval = v);
+
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton clearButton = new JButton("Clear Savestates");
+        clearButton.setToolTipText("Frees all cached TAS Maker checkpoints without touching recorded inputs - "
+                + "the next seek just replays from power-on again until new checkpoints accumulate.");
+        clearButton.addActionListener(e -> tasCheckpoints.clear());
+        buttonPanel.add(clearButton);
+
+        tasSettingsDialog.add(settingsPanel, BorderLayout.CENTER);
+        tasSettingsDialog.add(buttonPanel, BorderLayout.SOUTH);
+        tasSettingsDialog.pack();
+        tasSettingsDialog.setLocationRelativeTo(tasDialog);
+    }
+
+    //Adds one "label + spinner" settings row bound to an arbitrary int field via a
+    //getter/setter pair, advancing gbc.gridy for the next row. The spinner commits on
+    //every change (no separate OK/Apply step) since TAS Maker settings are cheap,
+    //reversible knobs, not something that needs a confirm step.
+    private void addIntSetting(JPanel panel, GridBagConstraints gbc, String label, int min, int max,
+                                java.util.function.IntSupplier getter, java.util.function.IntConsumer setter) {
+        gbc.gridx = 0;
+        panel.add(new JLabel(label), gbc);
+
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(getter.getAsInt(), min, max, 1));
+        spinner.addChangeListener(e -> setter.accept((Integer) spinner.getValue()));
+        gbc.gridx = 1;
+        panel.add(spinner, gbc);
+
+        gbc.gridy++;
+    }
+
+    private void openTasSettingsDialog() {
+        if (tasSettingsDialog == null) createTasSettingsDialog();
+        tasSettingsDialog.setVisible(true);
+    }
+
     //Drag-painting state for the button-timeline grid; see the mouse listeners in
     //createTASMakerWindow.
     //Whether the in-progress mouse drag started on the Frame# column; see the
@@ -532,6 +629,20 @@ public class NESEmulator extends JFrame implements Runnable {
     private void openTasMaker() {
         tasActive = true;
         audioPlayer.setMuted(true);
+        //Frame 0 must always mean power-on, but normal real-time play (or just sitting
+        //at the title screen since ROM load) runs the machine forward before the TAS
+        //Maker is ever opened - without this, frame 0 would silently be "whatever the
+        //game happened to be doing" instead of power-on, and the power-on-era lag
+        //frames (before the game's init routine starts polling input) would be lost.
+        //Only do this the first time - if there's already a movie/playhead (the user
+        //closed and reopened the TAS Maker), leave it exactly where it was.
+        if (tasFrame == 0 && tasInputs.isEmpty()) {
+            bus.hardReset();
+            tasValidFrontier = 0;
+            tasFrameStrobed.clear();
+            tasCheckpoints.clear();
+            displayPanel.renderFrame();
+        }
         tasTableModel.fireTableDataChanged();
         syncTasSelection();
         tasDialog.setVisible(true);
@@ -578,20 +689,23 @@ public class NESEmulator extends JFrame implements Runnable {
         recordFrameStrobe(executedRow);
         tasFrame++;
         if (tasFrame > tasValidFrontier) tasValidFrontier = tasFrame;
+        maybeCaptureTasCheckpoint(tasFrame);
         displayPanel.renderFrame();
         if (grew) tasTableModel.fireTableRowsInserted(executedRow, executedRow);
         else tasTableModel.fireTableRowsUpdated(executedRow, executedRow);
         syncTasSelection();
     }
 
-    //Moves the live playhead to "right after frame targetFrame-1 has executed". The
-    //CPU's cycle-stepping core has no serializable mid-instruction state to snapshot,
-    //so seeking backward (or past an edit that invalidated the frontier) is always a
-    //full, deterministic replay from power-on. But seeking FORWARD from the current
-    //playhead to a still-valid target needs no reset at all - the live cpu/ppu/apu/bus
-    //state already reflects every frame up to tasFrame, so we can just keep running
-    //from there. That's the common case (dragging/playing forward through the
-    //timeline) and skipping the replay-from-zero for it is what keeps scrubbing responsive.
+    //Moves the live playhead to "right after frame targetFrame-1 has executed".
+    //Seeking FORWARD from the current playhead to a still-valid target needs no
+    //reset at all - the live cpu/ppu/apu/bus state already reflects every frame up
+    //to tasFrame, so we can just keep running from there. That's the common case
+    //(dragging/playing forward through the timeline) and skipping any restore for it
+    //is what keeps scrubbing responsive. Otherwise (backward, or past an edit that
+    //invalidated the frontier), restore the nearest greenzone checkpoint at or before
+    //targetFrame (see tasCheckpoints) and replay only the remainder - falling back to
+    //a full replay from power-on only if no checkpoint that old exists (e.g. nothing's
+    //been played that far yet, or checkpoints were cleared).
     //Seeking never shrinks tasValidFrontier (the "how far has this actually been
     //emulated" marker) - only editFrameInput does, since replaying backward doesn't
     //invalidate anything, it just re-derives frames that are still known-good.
@@ -601,13 +715,21 @@ public class NESEmulator extends JFrame implements Runnable {
         //still valid - i.e. every frame it was built from still matches tasInputs.
         //That's true exactly while tasFrame <= tasValidFrontier; an edit can leave
         //tasFrame ahead of a (shrunk) frontier without moving the playhead back (see
-        //editFrameInput), so that case has to fall back to a full replay too.
+        //editFrameInput), so that case has to fall back to a checkpoint/full replay too.
         int replayFrom;
         if (targetFrame > tasFrame && tasFrame <= tasValidFrontier) {
             replayFrom = tasFrame;
         } else {
-            bus.hardReset();
-            replayFrom = 0;
+            Integer checkpointKey = tasCheckpoints.floorKey(targetFrame);
+            if (checkpointKey != null) {
+                TasCheckpoint checkpoint = tasCheckpoints.get(checkpointKey);
+                bus.restore(checkpoint.state);
+                displayPanel.restorePixels(checkpoint.pixels);
+                replayFrom = checkpointKey;
+            } else {
+                bus.hardReset();
+                replayFrom = 0;
+            }
         }
         //Seeking/scrubbing of any kind - forward, backward, one row or many - is never
         //real-time, so it's always silent (and setMuted(true) flushes anything still
@@ -620,12 +742,50 @@ public class NESEmulator extends JFrame implements Runnable {
             bus.setController1(bits);
             updateEmulationFrame();
             recordFrameStrobe(i);
+            maybeCaptureTasCheckpoint(i + 1);
         }
         tasFrame = targetFrame;
         if (targetFrame > tasValidFrontier) tasValidFrontier = targetFrame;
         displayPanel.renderFrame();
         syncTasSelection();
         tasTable.repaint();
+    }
+
+    //Captures a greenzone checkpoint for "executedCount frames have now run" if that
+    //count lands on the checkpoint grid (see tasSavestateInterval) and nothing's
+    //cached there yet. The live CPU may be mid-instruction at this exact frame
+    //boundary (a real NTSC frame - 89341/89342 PPU dots - doesn't divide evenly into
+    //CPU instruction boundaries), and CPU.State can only represent a clean boundary
+    //(see its comment) - so this keeps clocking cycles past the boundary, using
+    //whatever controller bits the NEXT frame will read (matching what the caller's
+    //own next loop iteration/tasAdvanceOneFrame call is about to set anyway), until
+    //CPU.isAtInstructionBoundary() goes true. That's normally at most ~7 CPU cycles.
+    //Any strobe that happens during that small drain is still correctly attributed -
+    //it's genuinely part of the next frame's execution, and gets folded into that
+    //frame's own recordFrameStrobe() call once the caller's loop reaches it.
+    private void maybeCaptureTasCheckpoint(int executedCount) {
+        if (executedCount <= 0) return; //frame 0's state is free via bus.hardReset()
+        if (tasSavestateInterval <= 0 || executedCount % tasSavestateInterval != 0) return;
+        if (tasCheckpoints.containsKey(executedCount)) return;
+        int bits = (executedCount - 1 < tasInputs.size()) ? tasInputs.get(executedCount - 1) : 0;
+        bus.setController1(bits);
+        while (!cpu.isAtInstructionBoundary()) {
+            apu.clock();
+            cpu.step(frameTraceBuffer, ppu, tracingEnabled);
+            ppu.step();
+            ppu.step();
+            ppu.step();
+        }
+        tasCheckpoints.put(executedCount, new TasCheckpoint(bus.snapshot(), displayPanel.snapshotPixels()));
+    }
+
+    //Drops every checkpoint whose key is past newFrontier - i.e. any checkpoint that
+    //reflects at least one frame at/after the edit or insertion point, matching
+    //exactly the same cutoff editFrameInput/insertTasFrames already use for
+    //tasValidFrontier (a checkpoint at key == newFrontier only reflects frames
+    //strictly before the change, so it's still good).
+    private void invalidateTasCheckpointsFrom(int newFrontier) {
+        tasCheckpoints.tailMap(newFrontier, false).clear();
     }
 
     //Captures whether controller 1 was strobed during the frame that was just
@@ -669,7 +829,10 @@ public class NESEmulator extends JFrame implements Runnable {
         int bits = tasInputs.get(row);
         bits = value ? (bits | bit) : (bits & ~bit);
         tasInputs.set(row, bits);
-        if (row + 1 < tasValidFrontier) tasValidFrontier = row + 1;
+        if (row + 1 < tasValidFrontier) {
+            tasValidFrontier = row + 1;
+            invalidateTasCheckpointsFrom(tasValidFrontier);
+        }
         tasTableModel.fireTableRowsUpdated(row, row);
         tasTable.repaint();
     }
@@ -696,7 +859,10 @@ public class NESEmulator extends JFrame implements Runnable {
         //insertPos on can still be trusted as "emulated" - the rows themselves just
         //haven't been replayed against their new contents yet (recordFrameStrobe
         //will naturally overwrite stale entries as replay reaches them again).
-        if (insertPos < tasValidFrontier) tasValidFrontier = insertPos;
+        if (insertPos < tasValidFrontier) {
+            tasValidFrontier = insertPos;
+            invalidateTasCheckpointsFrom(tasValidFrontier);
+        }
         tasTableModel.fireTableDataChanged();
 
         //Frames at/after the insertion point shifted - if the playhead was already
@@ -759,6 +925,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasFrameStrobed.clear();
         tasValidFrontier = 0;
         tasFrame = 0;
+        tasCheckpoints.clear();
         bus.hardReset();
         displayPanel.renderFrame();
         tasTableModel.fireTableDataChanged();
@@ -925,11 +1092,17 @@ public class NESEmulator extends JFrame implements Runnable {
         debugMenu.add(traceItem);
 
         JMenuItem nametableViewer = new JMenuItem("Nametable Viewer");
-        nametableViewer.addActionListener(e -> System.out.println("Open Nametable Debugger"));
+        nametableViewer.addActionListener(e -> {
+            nametableViewerDialog.refresh();
+            nametableViewerDialog.setVisible(true);
+        });
         debugMenu.add(nametableViewer);
 
-        JMenuItem patternTableViewer = new JMenuItem("Pattern Table Viewer");
-        patternTableViewer.addActionListener(e -> System.out.println("Open Pattern Table Viewer"));
+        JMenuItem patternTableViewer = new JMenuItem("PPU Inspector");
+        patternTableViewer.addActionListener(e -> {
+            ppuInspectorDialog.refresh();
+            ppuInspectorDialog.setVisible(true);
+        });
         debugMenu.add(patternTableViewer);
 
         JMenuItem memoryInspector = new JMenuItem("Memory Inspector");
@@ -1073,6 +1246,13 @@ public class NESEmulator extends JFrame implements Runnable {
         //fires table updates for those cells, so it never resets scroll position.
         if (memoryDialog.isVisible()) {
             scanMemoryForChanges();
+        }
+
+        if (nametableViewerDialog.isVisible()) {
+            nametableViewerDialog.refresh();
+        }
+        if (ppuInspectorDialog.isVisible()) {
+            ppuInspectorDialog.refresh();
         }
     }
 

@@ -275,6 +275,153 @@ public class CPU {
         if (debugDma) System.err.println("[t="+totalCycles+"] requestDmcDma1Cycle addr="+Integer.toHexString(address));
     }
 
+    //TAS Maker greenzone checkpoint support. Only ever captured when microOps is
+    //empty (see NESEmulator's checkpoint-capture loop, which drains to an
+    //instruction boundary before calling snapshot()) - that's what makes a plain
+    //field copy sufficient here despite microOps itself being a queue of
+    //non-serializable closures: at a boundary there's nothing in flight to lose,
+    //so State simply doesn't carry microOps at all, and restore() just clears it
+    //(defensively - it's always already empty when this is called).
+    public static final class State {
+        int a, x, y, sp, pc, status;
+        long totalCycles;
+        long dmcParityCycles;
+        int dataBus;
+        int addrAbs, fetched;
+        boolean pageCrossed;
+        boolean nmiPending, irqPending;
+        boolean latchedNmiPending, latchedIrqPending;
+        int stallCycles;
+        boolean oamDmaStall;
+        boolean lastCycleWasWrite;
+        int lastBusAddress;
+        boolean pendingOpIsWrite;
+        boolean dmcDmaPending;
+        int dmcDmaAddress;
+        boolean dmcDmaIsReload;
+        long scratchReqTotalCycles, scratchReqParityCycles;
+        boolean dmcDmaPendingVisible;
+        boolean dmcHalting;
+        int dmcHaltCyclesRemaining;
+        int dmcDummyReadAddr;
+        boolean oamDmaActive;
+        int oamDmaPage;
+        int oamByteIndex;
+        boolean oamGetDone;
+        int oamLatch;
+        int oamAlignRemaining;
+        boolean oamRealignPending;
+        int oamFrozenAddr;
+        boolean dmcGetPending;
+        boolean dmaHaltJustEnded;
+        boolean cycleFollowsDmcHalt;
+        boolean suppressHighByteCorruptionOnWrite;
+        boolean dmc1CyclePending;
+        int dmc1CycleAddress;
+        boolean dmc1CyclePendingVisible;
+        boolean dmc1CycleGetPending;
+        boolean dmcDmaAbortPending;
+        boolean dmcHaltAborted;
+    }
+
+    //Precondition: microOps.isEmpty() - see State's comment.
+    public State snapshot() {
+        State s = new State();
+        s.a = a; s.x = x; s.y = y; s.sp = sp; s.pc = pc; s.status = status;
+        s.totalCycles = totalCycles;
+        s.dmcParityCycles = dmcParityCycles;
+        s.dataBus = dataBus;
+        s.addrAbs = addrAbs; s.fetched = fetched;
+        s.pageCrossed = pageCrossed;
+        s.nmiPending = nmiPending; s.irqPending = irqPending;
+        s.latchedNmiPending = latchedNmiPending; s.latchedIrqPending = latchedIrqPending;
+        s.stallCycles = stallCycles;
+        s.oamDmaStall = oamDmaStall;
+        s.lastCycleWasWrite = lastCycleWasWrite;
+        s.lastBusAddress = lastBusAddress;
+        s.pendingOpIsWrite = pendingOpIsWrite;
+        s.dmcDmaPending = dmcDmaPending;
+        s.dmcDmaAddress = dmcDmaAddress;
+        s.dmcDmaIsReload = dmcDmaIsReload;
+        s.scratchReqTotalCycles = scratchReqTotalCycles; s.scratchReqParityCycles = scratchReqParityCycles;
+        s.dmcDmaPendingVisible = dmcDmaPendingVisible;
+        s.dmcHalting = dmcHalting;
+        s.dmcHaltCyclesRemaining = dmcHaltCyclesRemaining;
+        s.dmcDummyReadAddr = dmcDummyReadAddr;
+        s.oamDmaActive = oamDmaActive;
+        s.oamDmaPage = oamDmaPage;
+        s.oamByteIndex = oamByteIndex;
+        s.oamGetDone = oamGetDone;
+        s.oamLatch = oamLatch;
+        s.oamAlignRemaining = oamAlignRemaining;
+        s.oamRealignPending = oamRealignPending;
+        s.oamFrozenAddr = oamFrozenAddr;
+        s.dmcGetPending = dmcGetPending;
+        s.dmaHaltJustEnded = dmaHaltJustEnded;
+        s.cycleFollowsDmcHalt = cycleFollowsDmcHalt;
+        s.suppressHighByteCorruptionOnWrite = suppressHighByteCorruptionOnWrite;
+        s.dmc1CyclePending = dmc1CyclePending;
+        s.dmc1CycleAddress = dmc1CycleAddress;
+        s.dmc1CyclePendingVisible = dmc1CyclePendingVisible;
+        s.dmc1CycleGetPending = dmc1CycleGetPending;
+        s.dmcDmaAbortPending = dmcDmaAbortPending;
+        s.dmcHaltAborted = dmcHaltAborted;
+        return s;
+    }
+
+    public void restore(State s) {
+        a = s.a; x = s.x; y = s.y; sp = s.sp; pc = s.pc; status = s.status;
+        totalCycles = s.totalCycles;
+        dmcParityCycles = s.dmcParityCycles;
+        dataBus = s.dataBus;
+        addrAbs = s.addrAbs; fetched = s.fetched;
+        pageCrossed = s.pageCrossed;
+        nmiPending = s.nmiPending; irqPending = s.irqPending;
+        latchedNmiPending = s.latchedNmiPending; latchedIrqPending = s.latchedIrqPending;
+        stallCycles = s.stallCycles;
+        oamDmaStall = s.oamDmaStall;
+        lastCycleWasWrite = s.lastCycleWasWrite;
+        lastBusAddress = s.lastBusAddress;
+        pendingOpIsWrite = s.pendingOpIsWrite;
+        dmcDmaPending = s.dmcDmaPending;
+        dmcDmaAddress = s.dmcDmaAddress;
+        dmcDmaIsReload = s.dmcDmaIsReload;
+        scratchReqTotalCycles = s.scratchReqTotalCycles; scratchReqParityCycles = s.scratchReqParityCycles;
+        dmcDmaPendingVisible = s.dmcDmaPendingVisible;
+        dmcHalting = s.dmcHalting;
+        dmcHaltCyclesRemaining = s.dmcHaltCyclesRemaining;
+        dmcDummyReadAddr = s.dmcDummyReadAddr;
+        oamDmaActive = s.oamDmaActive;
+        oamDmaPage = s.oamDmaPage;
+        oamByteIndex = s.oamByteIndex;
+        oamGetDone = s.oamGetDone;
+        oamLatch = s.oamLatch;
+        oamAlignRemaining = s.oamAlignRemaining;
+        oamRealignPending = s.oamRealignPending;
+        oamFrozenAddr = s.oamFrozenAddr;
+        dmcGetPending = s.dmcGetPending;
+        dmaHaltJustEnded = s.dmaHaltJustEnded;
+        cycleFollowsDmcHalt = s.cycleFollowsDmcHalt;
+        suppressHighByteCorruptionOnWrite = s.suppressHighByteCorruptionOnWrite;
+        dmc1CyclePending = s.dmc1CyclePending;
+        dmc1CycleAddress = s.dmc1CycleAddress;
+        dmc1CyclePendingVisible = s.dmc1CyclePendingVisible;
+        dmc1CycleGetPending = s.dmc1CycleGetPending;
+        dmcDmaAbortPending = s.dmcDmaAbortPending;
+        dmcHaltAborted = s.dmcHaltAborted;
+        microOps.clear();
+    }
+
+    //True when there's no in-flight instruction (no pending microOps closures) to
+    //disturb, so it's safe to snapshot() right now. stallCycles (OAM DMA / DMC halt)
+    //is plain data, not a closure, so a stall in progress does NOT block snapshotting -
+    //requiring it to also be 0 would mean waiting out up to ~513 OAM DMA cycles instead
+    //of the few needed to drain microOps, which is exactly what checkpoint capture is
+    //trying to avoid.
+    public boolean isAtInstructionBoundary() {
+        return microOps.isEmpty();
+    }
+
     //Mirrors maybeStartDmcHalt()'s shape but for the 1-cycle DMA variant: no halt,
     //no alignment - either the very next cycle is free (steal it, do the get, done)
     //or it's a write (drop the request entirely, no retry).
