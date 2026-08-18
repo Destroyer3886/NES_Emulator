@@ -29,6 +29,11 @@ public class AudioPlayer {
     private int available = 0; //bytes currently queued for playback
 
     private volatile boolean running = false;
+    //When true, writeSample still runs the high-pass filter (so audio doesn't click
+    //when unmuted mid-stream) but drops the sample instead of queuing it. Used by the
+    //TAS Maker to silence replay of frames that are just being re-derived (seeking,
+    //scrubbing, already-validated frames) rather than actually played back.
+    private volatile boolean muted = false;
     private Thread playbackThread;
     private SourceDataLine line;
 
@@ -100,12 +105,38 @@ public class AudioPlayer {
     //sample is the raw non-negative APU mixer output (roughly 0.0-1.0). Never blocks -
     //if the playback thread can't keep up, oldest queued audio is dropped rather than
     //stalling the caller (the emulation thread).
+    //Muting alone only stops NEW samples from being queued - anything already sitting
+    //in the ring buffer keeps draining out at real-device speed regardless. That's
+    //fine for a brief mute, but the TAS Maker can generate many frames' worth of audio
+    //in a tight, non-real-time burst (a fast scroll, a long backward replay) - without
+    //also dropping whatever's already queued, that backlog keeps playing back (sounding
+    //like everything is "stacking up" and repeating) long after the emulator has moved
+    //on, and the growing backlog is itself extra work outside the emulation thread.
+    //So going from unmuted to muted always flushes the queue too - nothing queued
+    //while unmuted is expected to still matter once muted.
+    public void setMuted(boolean muted) {
+        boolean wasMuted = this.muted;
+        this.muted = muted;
+        if (muted && !wasMuted) flush();
+    }
+
+    //Discards whatever's currently queued for playback without stopping the line.
+    public void flush() {
+        synchronized (ringLock) {
+            available = 0;
+            readPos = writePos;
+            ringLock.notifyAll();
+        }
+    }
+
     public void writeSample(double sample) {
         if (!running) return;
 
         double filtered = sample - prevInput + HIGH_PASS_R * prevOutput;
         prevInput = sample;
         prevOutput = filtered;
+
+        if (muted) return;
 
         int pcm = (int) Math.round(filtered * 32767.0 * 2.0);
         if (pcm > 32767) pcm = 32767;

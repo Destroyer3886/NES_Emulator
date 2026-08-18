@@ -189,15 +189,13 @@ public class Bus {
         return 0;
     }
 
+    //OAM DMA is now a genuine cycle-stepped state machine living on CPU (see
+    //CPU.startOamDma()/runOamDmaCycle()) rather than a synchronous bulk copy - this
+    //lets a DMC DMA request interleave with it mid-transfer, per the nesdev wiki's
+    //"DMC DMA during OAM DMA" page (AccuracyCoin's "DMC DMA + OAM DMA", "Explicit
+    //DMA Abort" and "Implicit DMA Abort" tests specifically exercise this).
     private void oamDma(int page) {
-        int base = page << 8;
-        for (int i = 0; i < 256; i++) {
-            byte val = cpuRead(base + i);
-            ppu.cpuWrite(0x2004, val); //mirrors real hardware: each DMA byte behaves like an OAMDATA write
-        }
-        if (cpu != null) {
-            cpu.stallForOamDma(cpu.totalCycles % 2 == 0 ? 513 : 514);
-        }
+        if (cpu != null) cpu.startOamDma(page);
     }
 
     public byte ppuReadCartridge(int address) {

@@ -283,11 +283,24 @@ public class APU {
         //currentAddress/bytesRemaining; 0 means no restart is pending.
         int enableDelay = 0;
 
+        //Implicit DMA Abort ("1-cycle DMA"): counts down from a small grace window the
+        //instant a non-looping sample plays its last byte (dmaCompleted() leaving the
+        //buffer empty with nothing queued). While this is still >0, a fresh $4015
+        //re-enable's 3-cycle delay (enableDelay) finishing sees the "sample just
+        //ended" and "reload due" conditions as colliding, and fuses them into the
+        //special 1-cycle DMA (see CPU.requestDmcDma1Cycle()) instead of the ordinary
+        //halt-based one. This is deliberately short-lived (not a persistent "buffer is
+        //empty" latch) - the quirk is specifically about the two events landing on
+        //(essentially) the same cycle, not merely both having happened at some point.
+        int naturalEndGraceCycles = 0;
+        boolean sampleJustEndedNaturally() { return naturalEndGraceCycles > 0; }
+
         void writeReg0(int val) {
             irqEnable = (val & 0x80) != 0;
             loop = (val & 0x40) != 0;
             rateIndex = val & 0x0F;
             if (!irqEnable) { irqFlag = false; updateIrqLine(); }
+            if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] writeReg0 val="+Integer.toHexString(val)+" loop="+loop+" rate="+rateIndex);
         }
 
         void writeDirectLoad(int val) { outputLevel = val & 0x7F; }
@@ -309,22 +322,43 @@ public class APU {
         //ordinary "if (bytesRemaining>0) requestDma()" checks in clockTimer() below
         //already retry every cycle for free once it's reloaded - no extra state needed.
         void writeEnableFlag(boolean enable) {
+            if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] writeEnableFlag("+enable+") bytesRemaining="+bytesRemaining+" enableDelay="+enableDelay+" dmaPending="+dmaPending+" naturalEndGraceCycles="+naturalEndGraceCycles);
             if (!enable) {
                 bytesRemaining = 0;
                 enableDelay = 0;
-                //Explicit DMA Abort: disabling the channel while a DMA request is still
-                //pending or mid-halt on the CPU side must cancel it there too, not just
-                //here - see CPU.cancelDmcDma().
+                //An explicit disable clears the "sample just ended naturally" memory
+                //too - a reload after THIS kind of empty is the ordinary halt-based
+                //DMA, not the fused 1-cycle one (see naturalEndGraceCycles's decl).
+                naturalEndGraceCycles = 0;
+                //Explicit DMA Abort: notify the CPU side, which may need to truncate an
+                //already-scheduled-but-not-yet-halting DMC DMA request down to a single
+                //aborted cycle (or drop it entirely, if the halt is blocked by a write
+                //cycle) - see CPU.cancelDmcDma().
                 if (cpu != null) cpu.cancelDmcDma();
             } else if (bytesRemaining == 0 && enableDelay == 0) {
                 enableDelay = 3;
             }
         }
 
-        void requestDma() {
+        //isReload distinguishes the two DMC DMA scheduling shapes DMA Info.txt describes:
+        //the "load" DMA (right after $4015 enable finds an empty buffer) schedules to
+        //halt the CPU on a get cycle, while every subsequent "reload" DMA (buffer
+        //emptied during ongoing playback) schedules to halt on a put cycle. CPU.java's
+        //maybeStartDmcHalt() needs this distinction (not derivable from the DMA's own
+        //address or any other existing state) to compute the correct 2-vs-3 halt cycle
+        //count - see its comment.
+        void requestDma(boolean isReload) {
             if (dmaPending || bytesRemaining == 0) return;
             dmaPending = true;
-            if (cpu != null) cpu.requestDmcDma(currentAddress);
+            if (cpu != null) cpu.requestDmcDma(currentAddress, isReload);
+        }
+
+        //See sampleJustEndedNaturally's declaration and CPU.requestDmcDma1Cycle()'s
+        //comment for what makes this variant different from requestDma().
+        void requestDma1Cycle() {
+            if (dmaPending || bytesRemaining == 0) return;
+            dmaPending = true;
+            if (cpu != null) cpu.requestDmcDma1Cycle(currentAddress);
         }
 
         void dmaCompleted(int value) {
@@ -346,9 +380,16 @@ public class APU {
                 if (loop) {
                     currentAddress = sampleAddress;
                     bytesRemaining = sampleLength;
-                } else if (irqEnable) {
-                    irqFlag = true;
-                    updateIrqLine();
+                } else {
+                    //Opens the brief window a fresh $4015 re-enable can fuse with -
+                    //see naturalEndGraceCycles's declaration. Set regardless of
+                    //irqEnable: the 1-cycle DMA quirk is about the memory reader's
+                    //own empty/reload state, not the (independent) IRQ flag.
+                    naturalEndGraceCycles = 3;
+                    if (irqEnable) {
+                        irqFlag = true;
+                        updateIrqLine();
+                    }
                 }
             }
         }
@@ -362,7 +403,21 @@ public class APU {
                 if (enableDelay == 0) {
                     currentAddress = sampleAddress;
                     bytesRemaining = sampleLength;
-                    if (!bufferHasData) requestDma();
+                    if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] enableDelay reload bufferHasData="+bufferHasData+" naturalEndGraceCycles="+naturalEndGraceCycles);
+                    if (!bufferHasData) {
+                        //If the memory reader is still within the brief window after a
+                        //sample "just ended naturally", the reload and that empty
+                        //condition are colliding - fuse into the special 1-cycle DMA.
+                        //Otherwise (buffer was emptied some other way, e.g. an
+                        //explicit disable, or too long ago) this is an ordinary
+                        //fresh DMA.
+                        if (sampleJustEndedNaturally()) {
+                            naturalEndGraceCycles = 0;
+                            requestDma1Cycle();
+                        } else {
+                            requestDma(false); //load DMA
+                        }
+                    }
                 }
             }
 
@@ -383,7 +438,7 @@ public class APU {
                         shiftRegister = bufferByte;
                         bufferHasData = false;
                         silence = false;
-                        if (bytesRemaining > 0) requestDma();
+                        if (bytesRemaining > 0) requestDma(true); //reload DMA
                     } else {
                         silence = true;
                     }
@@ -398,6 +453,10 @@ public class APU {
             } else {
                 timerValue--;
             }
+
+            //Let the 1-cycle-DMA collision window (see naturalEndGraceCycles's
+            //declaration) expire on its own if nothing consumed it above.
+            if (naturalEndGraceCycles > 0) naturalEndGraceCycles--;
         }
     }
 
@@ -537,11 +596,19 @@ public class APU {
     // CPU-facing DMC DMA callback
     //-----------------------------------------------------------------
     public void dmcDmaCompleted(int value) { dmc.dmaCompleted(value); }
-    //Called by CPU.cancelDmcDma() when an in-flight DMA gets explicitly aborted before
-    //reaching its "get" cycle - clears the pending-request latch WITHOUT touching the
-    //buffer/address/length state that dmaCompleted() would (there's no fetched byte to
-    //commit). Without this, dmaPending would stay stuck true forever, permanently
-    //deadlocking every future requestDma() call (which no-ops while dmaPending is set).
+
+    //A pending 1-cycle DMA (see CPU.requestDmcDma1Cycle()) got silently dropped
+    //because the next cycle turned out to be a write. dmaPending was already
+    //latched true by Dmc.requestDma1Cycle() when the request was made, and unlike
+    //the normal path (which always eventually calls dmcDmaCompleted() to clear it),
+    //a dropped request never fetches anything - without this, dmaPending would
+    //stay stuck true forever and silently swallow every future DMC DMA request.
+    public void dmcDma1CycleDropped() { dmc.dmaPending = false; }
+
+    //Explicit DMA Abort: mirrors dmcDma1CycleDropped()'s purpose - a DMC DMA that CPU.java
+    //aborted (see CPU.cancelDmcDma()/maybeStartDmcHalt()) never calls dmcDmaCompleted(), so
+    //without this dmaPending would stay stuck true and the channel would never request
+    //another DMA.
     public void dmcDmaAborted() { dmc.dmaPending = false; }
 
     //-----------------------------------------------------------------
@@ -569,7 +636,9 @@ public class APU {
         //letting this echo actually update the external data bus for $4015, and for
         //every other address the caller already gets true open bus from Bus.cpuRead's
         //fallthrough (this method is only reached for $4000-$4015 - see Bus.cpuRead).
-        return (byte) (cpu != null ? cpu.dataBus : 0);
+        int ob = cpu != null ? cpu.dataBus : 0;
+        if (CPU.debugDma && address == 0x4000) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] read $4000 -> "+Integer.toHexString(ob)+" pc="+(cpu!=null?Integer.toHexString(cpu.pc):"?"));
+        return (byte) ob;
     }
 
     public void cpuWrite(int address, byte data) {
