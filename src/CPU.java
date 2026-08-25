@@ -44,11 +44,45 @@ public class CPU {
     //bus, from either a read or a write. Reads from unmapped address ranges return
     //this latched value instead of a fixed 0, matching real hardware's "open bus".
     public int dataBus = 0x00;
+    //Separate "internal" data bus latch (see AccuracyCoin's "Internal Data Bus"
+    //test): updated by every CPU-instruction-driven read/write (including reads of
+    //$4015, unlike the external dataBus above, which a $4015 read deliberately
+    //skips) but NEVER by a DMA's own read (see dmaRead()) - a DMC DMA's sample-byte
+    //fetch is a third-party bus master's read, not the CPU's own, so it only drives
+    //the external bus. $4015's open bit 5 is sourced from THIS field rather than
+    //dataBus, which is what keeps a DMC DMA bus conflict from leaking its sample
+    //byte's bits into a concurrent $4015 read.
+    public int internalDataBus = 0x00;
     public static boolean debugDma = false; //SCRATCH DEBUG - remove before finishing
 
     //Transient per-instruction state, valid once the effective address has been resolved
     private int addrAbs = 0x0000;
     private int fetched = 0x00;
+
+    //The bus address that the NEXT queued microOp cycle will access (read or write) as
+    //its first/only bus operation this cycle - set at the same moment that microOp is
+    //enqueued, using whatever address value is already known then (pc, addrAbs, a
+    //zero-page/indexed address, a stack address, a vector address, etc. - all of these
+    //are fully resolved local values by the time the closure that uses them is queued,
+    //so recording them here at enqueue time is exactly the value the closure will use
+    //when it actually runs). maybeStartDmcHalt() needs this: a DMC DMA halt that starts
+    //between cycles freezes the CPU's address bus at whatever the next (not yet run)
+    //cycle was about to access - which is this field - NOT necessarily addrAbs (that's
+    //only meaningful once an instruction's effective address has actually been
+    //resolved; before that, or for implied/accumulator-mode instructions that never use
+    //addrAbs at all, the next cycle reads pc instead). Using addrAbs unconditionally
+    //here used to leave it stale from whatever the PREVIOUS instruction last resolved -
+    //e.g. an INX right after STA $2007 would incorrectly target the old $2007 address
+    //for its dummy read, causing a spurious extra PPU $2007 access (and VRAM-address
+    //auto-increment) that doesn't happen on real hardware.
+    private int pendingCycleAddr = 0x0000;
+
+    //Enqueues a microOp cycle, recording the bus address it will access so
+    //maybeStartDmcHalt() can see it - see pendingCycleAddr's own comment.
+    private void enqueue(int addr, Runnable r) {
+        pendingCycleAddr = addr;
+        microOps.add(r);
+    }
     //Set whenever ABX/ABY/IZY indexing crosses a page boundary - SHA/SHX/SHY/TAS read
     //this to decide whether their write lands on addrAbs or a high-byte-corrupted address.
     private boolean pageCrossed = false;
@@ -62,6 +96,13 @@ public class CPU {
 
     private boolean nmiPending = false;
     private boolean irqPending = false;
+    //irqPending is the OR of every IRQ source's own line. APU owns apuIrqLine (it
+    //already ORs its own sub-sources - frame counter + DMC - before calling
+    //raiseIRQ()/clearIRQ()); a mapper (e.g. MMC3's scanline counter) owns
+    //mapperIrqLine via the separate raiseMapperIRQ()/clearMapperIRQ() pair. Keeping
+    //them apart means one source clearing its own line can never stomp the other's.
+    private boolean apuIrqLine = false;
+    private boolean mapperIrqLine = false;
 
     //Real 6502 hardware polls interrupt lines DURING an instruction - before its final
     //cycle, using whatever flag/pending state existed at that point - not "after the
@@ -184,6 +225,9 @@ public class CPU {
     //"put" (write) cycles, and OAM DMA needs one dummy "realignment" cycle after a
     //DMC get steals one of its own get cycles.
     private boolean oamDmaActive = false;
+    //A $4014 write has asserted the DMA request, but the transfer hasn't begun yet
+    //because a DMA can't start on a write cycle. See startOamDma/stepInner.
+    private boolean oamDmaStartPending = false;
     private int oamDmaPage = 0;
     private int oamByteIndex = 0;      //0-255: which OAM byte is currently in flight
     private boolean oamGetDone = false; //true once the current byte's "get" has happened, awaiting its "put"
@@ -287,9 +331,11 @@ public class CPU {
         long totalCycles;
         long dmcParityCycles;
         int dataBus;
+        int internalDataBus;
         int addrAbs, fetched;
         boolean pageCrossed;
         boolean nmiPending, irqPending;
+        boolean apuIrqLine, mapperIrqLine;
         boolean latchedNmiPending, latchedIrqPending;
         int stallCycles;
         boolean oamDmaStall;
@@ -331,9 +377,11 @@ public class CPU {
         s.totalCycles = totalCycles;
         s.dmcParityCycles = dmcParityCycles;
         s.dataBus = dataBus;
+        s.internalDataBus = internalDataBus;
         s.addrAbs = addrAbs; s.fetched = fetched;
         s.pageCrossed = pageCrossed;
         s.nmiPending = nmiPending; s.irqPending = irqPending;
+        s.apuIrqLine = apuIrqLine; s.mapperIrqLine = mapperIrqLine;
         s.latchedNmiPending = latchedNmiPending; s.latchedIrqPending = latchedIrqPending;
         s.stallCycles = stallCycles;
         s.oamDmaStall = oamDmaStall;
@@ -374,9 +422,11 @@ public class CPU {
         totalCycles = s.totalCycles;
         dmcParityCycles = s.dmcParityCycles;
         dataBus = s.dataBus;
+        internalDataBus = s.internalDataBus;
         addrAbs = s.addrAbs; fetched = s.fetched;
         pageCrossed = s.pageCrossed;
         nmiPending = s.nmiPending; irqPending = s.irqPending;
+        apuIrqLine = s.apuIrqLine; mapperIrqLine = s.mapperIrqLine;
         latchedNmiPending = s.latchedNmiPending; latchedIrqPending = s.latchedIrqPending;
         stallCycles = s.stallCycles;
         oamDmaStall = s.oamDmaStall;
@@ -471,8 +521,19 @@ public class CPU {
     //the actual byte-by-byte transfer happens one cycle at a time via
     //runOamDmaCycle(), driven from stepInner() on subsequent step() calls.
     public void startOamDma(int page) {
-        oamDmaActive = true;
+        //$4014 is a single request line plus a page register, so a second write while
+        //a request is already in flight only updates the page - it never starts a
+        //second transfer.
+        //A DMA cannot begin on a CPU write cycle, and this call IS happening on one -
+        //so all a $4014 write does is load the page register and assert the request.
+        //The transfer starts on the next non-write cycle (see stepInner). This is what
+        //makes a read-modify-write like INC $4014 - which writes twice on consecutive
+        //cycles - produce exactly ONE OAM DMA, using the second write's page, instead
+        //of splitting the instruction around a DMA that started on its first write.
+        //See AccuracyCoin "INC $4014" tests 2 and 3.
         oamDmaPage = page;
+        if (oamDmaActive || oamDmaStartPending) return;
+        oamDmaStartPending = true;
         oamByteIndex = 0;
         oamGetDone = false;
         oamRealignPending = false;
@@ -627,7 +688,7 @@ public class CPU {
         //resolved into addrAbs by the addressing-mode cycle that just ran (each
         //beginRWM() case computes addrAbs and enqueues the final read/write/rmw cycle
         //in the same CPU cycle), so addrAbs is exactly the pending cycle's target.
-        dmcDummyReadAddr = microOps.isEmpty() ? pc : addrAbs;
+        dmcDummyReadAddr = microOps.isEmpty() ? pc : pendingCycleAddr;
         if (dmcDmaAbortPending) {
             //Explicit DMA Abort: the halt happens (it can't be un-scheduled at this
             //point), but instead of the usual dummy/alignment cycles plus a final get,
@@ -712,6 +773,9 @@ public class CPU {
         //latch, not the CPU's external data bus - real hardware quirk, not a general
         //open-bus exception.
         if (addr != 0x4015) dataBus = v & 0xFF;
+        //Unlike the external bus above, EVERY CPU-driven read (including $4015's)
+        //updates the internal latch - see internalDataBus's own comment.
+        internalDataBus = v & 0xFF;
         lastBusAddress = addr;
         return v;
     }
@@ -736,9 +800,22 @@ public class CPU {
     //See AccuracyCoin's "APU Register Activation" and "DMC DMA Bus Conflicts" tests, and
     //the nesdev wiki's "DMA open bus" / "DMC DMA bus conflict" pages.
     private int dmaRead(int dmaAddr, int cpuAddressBus) {
+        boolean apuActive = (cpuAddressBus & 0xFFE0) == 0x4000;
+        //The APU/IO chip-select is driven ONLY by the 6502's own (frozen) address
+        //bus, never by the DMA's real target - so if the target itself happens to
+        //land in $4000-$401F while the 6502 address bus does NOT, nothing at all
+        //selects that address (no register, no RAM/ROM/PPU either): it must NOT be
+        //routed through bus.cpuRead (which would just decode the raw address and
+        //hit the real register regardless, plus trigger any register-read side
+        //effects like clearing $4015's IRQ flag) - it's pure open bus.
+        if (!apuActive && (dmaAddr & 0xFFE0) == 0x4000) {
+            int real = dataBus & 0xFF;
+            lastBusAddress = dmaAddr;
+            return real;
+        }
         int real = bus.cpuRead(dmaAddr) & 0xFF;
         if (debugDma) System.err.println("[t="+totalCycles+"] dmaRead addr="+Integer.toHexString(dmaAddr)+" cpuAddrBus="+Integer.toHexString(cpuAddressBus)+" val="+Integer.toHexString(real));
-        if ((cpuAddressBus & 0xFFE0) != 0x4000) {
+        if (!apuActive) {
             dataBus = real;
             lastBusAddress = dmaAddr;
             return real;
@@ -757,6 +834,7 @@ public class CPU {
     public void write(int addr, byte data) {
         bus.cpuWrite(addr, data);
         dataBus = data & 0xFF;
+        internalDataBus = data & 0xFF;
         lastBusAddress = addr;
         lastCycleWasWrite = true;
         if (debugDma && ((addr >= 0x50 && addr <= 0x5F) || addr == 0x4015)) System.err.println("[t="+totalCycles+"] write $"+Integer.toHexString(addr)+" = "+Integer.toHexString(data&0xFF));
@@ -784,6 +862,8 @@ public class CPU {
         microOps.clear();
         nmiPending = false;
         irqPending = false;
+        apuIrqLine = false;
+        mapperIrqLine = false;
         latchedNmiPending = false;
         latchedIrqPending = false;
         stallCycles = 0;
@@ -824,8 +904,14 @@ public class CPU {
     //Level-sensitive: held asserted for as long as any IRQ source (APU frame counter,
     //DMC) still wants it. The source is responsible for calling clearIRQ() only once
     //none of its own conditions are asserted anymore.
-    public void raiseIRQ() { irqPending = true; }
-    public void clearIRQ() { irqPending = false; }
+    public void raiseIRQ() { apuIrqLine = true; irqPending = apuIrqLine || mapperIrqLine; }
+    public void clearIRQ() { apuIrqLine = false; irqPending = apuIrqLine || mapperIrqLine; }
+
+    //Same level-sensitive contract as raiseIRQ()/clearIRQ() above, but for mapper IRQ
+    //sources (e.g. MMC3's scanline counter) - kept on a separate line so the mapper
+    //and the APU can never clear each other's still-pending IRQ.
+    public void raiseMapperIRQ() { mapperIrqLine = true; irqPending = apuIrqLine || mapperIrqLine; }
+    public void clearMapperIRQ() { mapperIrqLine = false; irqPending = apuIrqLine || mapperIrqLine; }
 
     //Runs exactly one clock cycle. Matches the CPU-clock-per-call contract the rest
     //of the emulator already assumes (NESEmulator calls this once per real CPU cycle).
@@ -843,6 +929,15 @@ public class CPU {
     }
 
     private void stepInner(StringBuilder traceBuffer, PPU ppu, boolean tracingEnabled) {
+        //Promote a pending $4014 request into a running transfer, but only once the
+        //CPU is off its write cycles - a DMA can't halt the CPU on a write. Same
+        //pendingOpIsWrite gate maybeStartDmcHalt() uses, and same one-cycle-lagged
+        //reading of it (it still describes the cycle that just finished at this point).
+        if (oamDmaStartPending && !pendingOpIsWrite) {
+            oamDmaStartPending = false;
+            oamDmaActive = true;
+        }
+
         if (oamDmaActive) {
             runOamDmaCycle();
             return;
@@ -876,6 +971,9 @@ public class CPU {
                 enqueueInterrupt(0xFFFA);
             } else if (latchedIrqPending) {
                 latchedIrqPending = false;
+                if (tracingEnabled && traceBuffer != null) {
+                    traceBuffer.append("=========  IRQ  =========\n");
+                }
                 enqueueInterrupt(0xFFFE);
             } else {
                 if (tracingEnabled && traceBuffer != null) {
@@ -907,8 +1005,9 @@ public class CPU {
             //No halt/alignment cycles for this variant - the stolen cycle itself
             //performs the get. The frozen address bus for the (nonexistent) dummy
             //reads is whatever the pending cycle's own target would have been - see
-            //maybeStartDmcHalt()'s identical microOps.isEmpty()?pc:addrAbs logic.
-            int busAddr = microOps.isEmpty() ? pc : addrAbs;
+            //maybeStartDmcHalt()'s identical microOps.isEmpty()?pc:pendingCycleAddr logic
+            //(and pendingCycleAddr's own comment for why addrAbs alone isn't enough).
+            int busAddr = microOps.isEmpty() ? pc : pendingCycleAddr;
             int value = dmaRead(dmc1CycleAddress, busAddr);
             if (apu != null) apu.dmcDmaCompleted(value);
         } else if (dmcHalting) {
@@ -954,15 +1053,15 @@ public class CPU {
         Opcode op = lookupTable[opcode];
 
         if (op.type == OpType.OTHER) {
-            microOps.add(op.customFirst);
+            enqueue(pc, op.customFirst);
         } else if (op.mode == AddrMode.ACC) {
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 pollInterrupts();
                 read(pc); //dummy read, real hardware still reads the next byte
                 a = op.rmwOp.run(a) & 0xFF;
             });
         } else if (op.mode == AddrMode.IMM) {
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 pollInterrupts();
                 fetched = read(pc) & 0xFF;
                 pc = (pc + 1) & 0xFFFF;
@@ -980,7 +1079,7 @@ public class CPU {
     private void beginRWM(Opcode op) {
         switch (op.mode) {
             case ZP0:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     addrAbs = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
                     enqueueFinal(op);
@@ -989,10 +1088,10 @@ public class CPU {
 
             case ZPX:
             case ZPY:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     int zpBase = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
-                    microOps.add(() -> {
+                    enqueue(zpBase, () -> {
                         read(zpBase); //dummy read at the unindexed zero-page address
                         int index = (op.mode == AddrMode.ZPX) ? x : y;
                         addrAbs = (zpBase + index) & 0xFF;
@@ -1002,10 +1101,10 @@ public class CPU {
                 break;
 
             case ABS:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     int lo = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
-                    microOps.add(() -> {
+                    enqueue(pc, () -> {
                         int hi = read(pc) & 0xFF;
                         pc = (pc + 1) & 0xFFFF;
                         addrAbs = (hi << 8) | lo;
@@ -1016,10 +1115,10 @@ public class CPU {
 
             case ABX:
             case ABY:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     int lo = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
-                    microOps.add(() -> {
+                    enqueue(pc, () -> {
                         int hi = read(pc) & 0xFF;
                         pc = (pc + 1) & 0xFFFF;
                         int index = (op.mode == AddrMode.ABX) ? x : y;
@@ -1036,8 +1135,9 @@ public class CPU {
                             enqueueFinal(op);
                         } else {
                             //WRITE/RMW always spend this cycle; READ only spends it on a page cross
-                            microOps.add(() -> {
-                                read((base & 0xFF00) | (addrAbs & 0xFF));
+                            int uncorrectedAddr = (base & 0xFF00) | (addrAbs & 0xFF);
+                            enqueue(uncorrectedAddr, () -> {
+                                read(uncorrectedAddr);
                                 enqueueFinal(op);
                             });
                         }
@@ -1046,14 +1146,16 @@ public class CPU {
                 break;
 
             case IZX:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     int zpBase = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
-                    microOps.add(() -> {
+                    enqueue(zpBase, () -> {
                         read(zpBase); //dummy read before X is applied
-                        microOps.add(() -> {
+                        int izxLo = (zpBase + x) & 0xFF;
+                        enqueue(izxLo, () -> {
                             int lo = read((zpBase + x) & 0xFF) & 0xFF;
-                            microOps.add(() -> {
+                            int izxHi = (zpBase + x + 1) & 0xFF;
+                            enqueue(izxHi, () -> {
                                 int hi = read((zpBase + x + 1) & 0xFF) & 0xFF;
                                 addrAbs = (hi << 8) | lo;
                                 enqueueFinal(op);
@@ -1064,12 +1166,13 @@ public class CPU {
                 break;
 
             case IZY:
-                microOps.add(() -> {
+                enqueue(pc, () -> {
                     int zpBase = read(pc) & 0xFF;
                     pc = (pc + 1) & 0xFFFF;
-                    microOps.add(() -> {
+                    enqueue(zpBase, () -> {
                         int lo = read(zpBase) & 0xFF;
-                        microOps.add(() -> {
+                        int izyHi = (zpBase + 1) & 0xFF;
+                        enqueue(izyHi, () -> {
                             int hi = read((zpBase + 1) & 0xFF) & 0xFF;
                             int base = (hi << 8) | lo;
                             addrAbs = (base + y) & 0xFFFF;
@@ -1083,8 +1186,9 @@ public class CPU {
                             if (op.type == OpType.READ && !crossed) {
                                 enqueueFinal(op);
                             } else {
-                                microOps.add(() -> {
-                                    read((base & 0xFF00) | (addrAbs & 0xFF));
+                                int uncorrectedAddr = (base & 0xFF00) | (addrAbs & 0xFF);
+                                enqueue(uncorrectedAddr, () -> {
+                                    read(uncorrectedAddr);
                                     enqueueFinal(op);
                                 });
                             }
@@ -1104,7 +1208,7 @@ public class CPU {
     private void enqueueFinal(Opcode op) {
         switch (op.type) {
             case READ:
-                microOps.add(() -> {
+                enqueue(addrAbs, () -> {
                     pollInterrupts();
                     fetched = read(addrAbs) & 0xFF;
                     op.readOp.run(fetched);
@@ -1112,7 +1216,7 @@ public class CPU {
                 break;
 
             case WRITE:
-                microOps.add(() -> {
+                enqueue(addrAbs, () -> {
                     pollInterrupts();
                     boolean suppress = suppressHighByteCorruptionOnWrite && op.highByteCorruption;
                     suppressHighByteCorruptionOnWrite = false;
@@ -1141,11 +1245,11 @@ public class CPU {
                 break;
 
             case RMW:
-                microOps.add(() -> {
+                enqueue(addrAbs, () -> {
                     fetched = read(addrAbs) & 0xFF;
-                    microOps.add(() -> {
+                    enqueue(addrAbs, () -> {
                         write(addrAbs, (byte) fetched); //dummy write-back of the unmodified value
-                        microOps.add(() -> {
+                        enqueue(addrAbs, () -> {
                             pollInterrupts();
                             int result = op.rmwOp.run(fetched) & 0xFF;
                             write(addrAbs, (byte) result);
@@ -1178,13 +1282,13 @@ public class CPU {
     //the shared 5-cycle push+vector chain.
     private void enqueueInterrupt(int vector) {
         boolean hijackable = (vector == 0xFFFE); //only IRQ can be hijacked by NMI, not NMI by itself
-        microOps.add(() -> {
+        enqueue(pc, () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 read(pc);
                 int[] vectorBox = {vector};
                 if (hijackable && pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
-                microOps.add(pushAndVectorFirst(vectorBox, false, hijackable));
+                enqueue(0x0100 + sp, pushAndVectorFirst(vectorBox, false, hijackable));
                 pendingOpIsWrite = true;
             });
         });
@@ -1202,12 +1306,12 @@ public class CPU {
             if (hijackable && pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
             write(0x0100 + sp, (byte) ((pc >> 8) & 0xFF));
             sp = (sp - 1) & 0xFF;
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 pollInterrupts();
                 if (hijackable && pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
                 write(0x0100 + sp, (byte) (pc & 0xFF));
                 sp = (sp - 1) & 0xFF;
-                microOps.add(() -> {
+                enqueue(0x0100 + sp, () -> {
                     if (hijackable && pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
                     write(0x0100 + sp, (byte) (status | U | (pushB ? B : 0)));
                     sp = (sp - 1) & 0xFF;
@@ -1217,9 +1321,9 @@ public class CPU {
                     //ends, I is already true, so a still-pending IRQ must NOT look
                     //like it can immediately re-fire right after this sequence.
                     pollInterrupts();
-                    microOps.add(() -> {
+                    enqueue(vectorBox[0], () -> {
                         int lo = read(vectorBox[0]) & 0xFF;
-                        microOps.add(() -> {
+                        enqueue(vectorBox[0] + 1, () -> {
                             int hi = read(vectorBox[0] + 1) & 0xFF;
                             pc = (hi << 8) | lo;
                         });
@@ -1262,16 +1366,17 @@ public class CPU {
 
             if (!cond.getAsBoolean()) return; //not taken: 2 cycles total
 
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 read(pc); //dummy read, branch is being taken - no poll here
                 int oldPc = pc;
                 int target = (pc + signedOffset) & 0xFFFF;
                 pc = target;
 
                 if ((oldPc & 0xFF00) != (target & 0xFF00)) {
-                    microOps.add(() -> {
+                    int fixupAddr = (oldPc & 0xFF00) | (target & 0xFF);
+                    enqueue(fixupAddr, () -> {
                         pollInterruptsBranchSecond(); //poll before cycle 4 (only exists if page crossed)
-                        read((oldPc & 0xFF00) | (target & 0xFF));
+                        read(fixupAddr);
                     });
                 }
             });
@@ -1287,7 +1392,7 @@ public class CPU {
             if (pollAndConsumeNmi()) vectorBox[0] = 0xFFFA;
             read(pc); //padding byte, discarded
             pc = (pc + 1) & 0xFFFF;
-            microOps.add(pushAndVectorFirst(vectorBox, true, true));
+            enqueue(0x0100 + sp, pushAndVectorFirst(vectorBox, true, true));
             pendingOpIsWrite = true;
         };
     }
@@ -1296,15 +1401,15 @@ public class CPU {
         return () -> {
             int lo = read(pc) & 0xFF;
             pc = (pc + 1) & 0xFFFF;
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 read(0x0100 + sp); //internal delay cycle
-                microOps.add(() -> {
+                enqueue(0x0100 + sp, () -> {
                     write(0x0100 + sp, (byte) ((pc >> 8) & 0xFF));
                     sp = (sp - 1) & 0xFF;
-                    microOps.add(() -> {
+                    enqueue(0x0100 + sp, () -> {
                         write(0x0100 + sp, (byte) (pc & 0xFF));
                         sp = (sp - 1) & 0xFF;
-                        microOps.add(() -> {
+                        enqueue(pc, () -> {
                             pollInterrupts();
                             int hi = read(pc) & 0xFF;
                             pc = (hi << 8) | lo;
@@ -1320,16 +1425,27 @@ public class CPU {
     private Runnable rts() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 read(0x0100 + sp);
-                microOps.add(() -> {
+                //The next 2 cycles each increment sp THEN read at the new sp, inside
+                //the same closure - so the address that closure will actually access
+                //is 0x0100+sp AFTER that increment, not the current (pre-increment) sp
+                //this enqueue() call sees. Must compute the post-increment address
+                //explicitly here rather than just passing the current sp - see
+                //pendingCycleAddr's own comment for why getting this wrong matters.
+                enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                     sp = (sp + 1) & 0xFF;
                     int lo = read(0x0100 + sp) & 0xFF;
-                    microOps.add(() -> {
+                    enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                         sp = (sp + 1) & 0xFF;
                         int hi = read(0x0100 + sp) & 0xFF;
                         pc = (hi << 8) | lo;
-                        microOps.add(() -> {
+                        enqueue(pc, () -> {
+                            //Cycle 6: a dummy read at the just-restored return address
+                            //(before PC is incremented past it) - real hardware's RTS
+                            //spends this cycle incrementing PC, but it's still a genuine
+                            //bus cycle that reads the old (pre-increment) PC first.
+                            read(pc);
                             pollInterrupts();
                             pc = (pc + 1) & 0xFFFF;
                         });
@@ -1342,17 +1458,19 @@ public class CPU {
     private Runnable rti() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 read(0x0100 + sp);
-                microOps.add(() -> {
+                //See rts()'s identical comment: these cycles increment sp before
+                //reading, so the enqueued address must anticipate that increment.
+                enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                     sp = (sp + 1) & 0xFF;
                     status = read(0x0100 + sp) & 0xFF;
                     status &= ~B;
                     status |= U;
-                    microOps.add(() -> {
+                    enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                         sp = (sp + 1) & 0xFF;
                         int lo = read(0x0100 + sp) & 0xFF;
-                        microOps.add(() -> {
+                        enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                             pollInterrupts();
                             sp = (sp + 1) & 0xFF;
                             int hi = read(0x0100 + sp) & 0xFF;
@@ -1367,7 +1485,7 @@ public class CPU {
     private Runnable pha() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 pollInterrupts();
                 write(0x0100 + sp, (byte) a);
                 sp = (sp - 1) & 0xFF;
@@ -1379,7 +1497,7 @@ public class CPU {
     private Runnable php() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 pollInterrupts();
                 write(0x0100 + sp, (byte) (status | B | U));
                 sp = (sp - 1) & 0xFF;
@@ -1391,9 +1509,10 @@ public class CPU {
     private Runnable pla() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 read(0x0100 + sp);
-                microOps.add(() -> {
+                //See rts()'s comment: sp increments before this next read.
+                enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                     pollInterrupts();
                     sp = (sp + 1) & 0xFF;
                     a = read(0x0100 + sp) & 0xFF;
@@ -1407,9 +1526,10 @@ public class CPU {
     private Runnable plp() {
         return () -> {
             read(pc);
-            microOps.add(() -> {
+            enqueue(0x0100 + sp, () -> {
                 read(0x0100 + sp);
-                microOps.add(() -> {
+                //See rts()'s comment: sp increments before this next read.
+                enqueue(0x0100 + ((sp + 1) & 0xFF), () -> {
                     //Poll BEFORE pulling status off the stack - real hardware polls
                     //using the OLD I flag, before PLP's own write of the new one lands.
                     pollInterrupts();
@@ -1431,7 +1551,7 @@ public class CPU {
         return () -> {
             int lo = read(pc) & 0xFF;
             pc = (pc + 1) & 0xFFFF;
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 pollInterrupts();
                 int hi = read(pc) & 0xFF;
                 pc = (pc + 1) & 0xFFFF;
@@ -1444,15 +1564,15 @@ public class CPU {
         return () -> {
             int ptrLo = read(pc) & 0xFF;
             pc = (pc + 1) & 0xFFFF;
-            microOps.add(() -> {
+            enqueue(pc, () -> {
                 int ptrHi = read(pc) & 0xFF;
                 pc = (pc + 1) & 0xFFFF;
                 int ptr = (ptrHi << 8) | ptrLo;
-                microOps.add(() -> {
+                enqueue(ptr, () -> {
                     int lo = read(ptr) & 0xFF;
-                    microOps.add(() -> {
+                    int hiAddr = ((ptr & 0x00FF) == 0x00FF) ? (ptr & 0xFF00) : (ptr + 1);
+                    enqueue(hiAddr, () -> {
                         pollInterrupts();
-                        int hiAddr = ((ptr & 0x00FF) == 0x00FF) ? (ptr & 0xFF00) : (ptr + 1);
                         int hi = read(hiAddr) & 0xFF;
                         pc = (hi << 8) | lo;
                     });

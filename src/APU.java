@@ -666,6 +666,7 @@ public class APU {
         fiveStepMode = false;
         irqInhibit = false;
         frameIrqFlag = false;
+        frameIrqClearAfterCycle = -1;
         frameCycle = 0;
         resetDelay = 0;
         apuCycleToggle = false;
@@ -702,12 +703,41 @@ public class APU {
 
     private void updateIrqLine() {
         if (cpu == null) return;
-        if (frameIrqFlag || dmc.irqFlag) cpu.raiseIRQ();
+        //The frame counter's IRQ level detector is only pulled low when interrupts
+        //aren't suppressed. The $4015 flag itself can be set while suppressed (see
+        //stepFrameSequencer's 29828/29829 cases), but that must not raise an IRQ.
+        if ((frameIrqFlag && !irqInhibit) || dmc.irqFlag) cpu.raiseIRQ();
         else cpu.clearIRQ();
     }
 
+    //Set to the CPU cycle number of a $4015 read that is due to clear the frame
+    //counter IRQ flag; -1 when nothing is pending. See cpuRead's $4015 case.
+    private long frameIrqClearAfterCycle = -1;
+
+    //The frame counter's IRQ level detector follows the $4015 flag one CPU cycle
+    //behind, so the CPU sees the IRQ line go low one cycle after the flag reads as
+    //set. AccuracyCoin "Frame Counter IRQ" tests N and O pin this down to the exact
+    //cycle by counting how many INX instructions execute before the IRQ is taken.
+    private boolean frameIrqAssertPending = false;
+
     //Advances every part of the APU by one CPU cycle.
     public void clock() {
+        //Deferred $4015 IRQ-flag clear, performed on the first "get" cycle strictly
+        //after the read's own cycle. clock() runs ahead of the CPU's bus access for
+        //this cycle, so clearing here makes the new value visible to a read that
+        //happens on this same cycle - which is what the double-read test observes.
+        if (frameIrqClearAfterCycle >= 0 && cpu != null
+                && cpu.totalCycles > frameIrqClearAfterCycle && (cpu.totalCycles & 1L) == 0L) {
+            frameIrqClearAfterCycle = -1;
+            frameIrqFlag = false;
+            updateIrqLine();
+        }
+
+        if (frameIrqAssertPending) {
+            frameIrqAssertPending = false;
+            updateIrqLine();
+        }
+
         if (resetDelay > 0) {
             resetDelay--;
             if (resetDelay == 0) {
@@ -748,15 +778,29 @@ public class APU {
                 case 7457: clockQuarterFrame(); break;
                 case 14913: clockQuarterFrame(); clockHalfFrame(); break;
                 case 22371: clockQuarterFrame(); break;
+                //The frame counter's "set interrupt flag" signal is asserted across
+                //three consecutive CPU cycles, not one. On the first two the $4015
+                //flag is set unconditionally - even with interrupts suppressed - and
+                //only on the third does the suppress flag decide whether it stays set.
+                //That two-cycle window where a suppressed flag still reads as 1 is
+                //what AccuracyCoin "Frame Counter IRQ" tests I-L check, and the
+                //re-assertion on each of those cycles is what makes tests F and G's
+                //"read it, but it gets set again" behavior work.
+                //The IRQ line itself is only ever pulled low when not suppressed -
+                //see updateIrqLine.
                 case 29828:
-                    if (!irqInhibit) { frameIrqFlag = true; updateIrqLine(); }
+                    frameIrqFlag = true;
+                    frameIrqAssertPending = true;
                     break;
                 case 29829:
                     clockQuarterFrame();
                     clockHalfFrame();
-                    if (!irqInhibit) { frameIrqFlag = true; updateIrqLine(); }
+                    frameIrqFlag = true;
+                    frameIrqAssertPending = true;
                     break;
                 case 29830:
+                    frameIrqFlag = !irqInhibit;
+                    frameIrqAssertPending = true;
                     frameCycle = 0;
                     break;
                 default: break;
@@ -810,12 +854,21 @@ public class APU {
             if (dmc.bytesRemaining > 0) val |= 0x10;
             if (frameIrqFlag) val |= 0x40;
             if (dmc.irqFlag) val |= 0x80;
-            //Bit 5 is open bus - it isn't driven by anything in this register.
-            val = (val & ~0x20) | ((cpu != null ? cpu.dataBus : 0) & 0x20);
+            //Bit 5 is open bus - it isn't driven by anything in this register. It's
+            //sourced from the CPU's INTERNAL data bus latch (not the external one) -
+            //see CPU.internalDataBus's comment: a concurrent DMC DMA sample-byte read
+            //only drives the external bus, so it must not leak into this bit.
+            val = (val & ~0x20) | ((cpu != null ? cpu.internalDataBus : 0) & 0x20);
 
-            //Reading $4015 clears the frame IRQ flag (but not the DMC IRQ flag).
-            frameIrqFlag = false;
-            updateIrqLine();
+            //Reading $4015 clears the frame IRQ flag (but not the DMC IRQ flag) - but
+            //NOT within this read cycle. The clear is performed by the APU's own
+            //sequencer logic on the next "get" cycle, so a read that lands on a get
+            //cycle has its clear take effect on the very next cycle, while a read that
+            //lands on a put cycle doesn't clear until one cycle later still. This is
+            //observable via a double-read instruction (SLO abs,X on $4015) - see
+            //AccuracyCoin "Frame Counter IRQ" tests 6 and 7, whose comments explicitly
+            //recommend implementing it exactly this way rather than clearing inline.
+            if (frameIrqFlag) frameIrqClearAfterCycle = (cpu != null) ? cpu.totalCycles : -1;
             return (byte) val;
         }
         //Every other APU register is write-only; CPU.read() is responsible for not
@@ -874,7 +927,7 @@ public class APU {
             case 0x4017: {
                 fiveStepMode = (val & 0x80) != 0;
                 irqInhibit = (val & 0x40) != 0;
-                if (irqInhibit) { frameIrqFlag = false; updateIrqLine(); }
+                if (irqInhibit) { frameIrqClearAfterCycle = -1; frameIrqFlag = false; updateIrqLine(); }
                 //The sequencer reset takes effect 3 CPU cycles later if this write
                 //landed on an odd CPU cycle, 4 cycles later if even.
                 resetDelay = (cpu != null && (cpu.totalCycles & 1) != 0) ? 3 : 4;

@@ -25,6 +25,15 @@ public class Bus {
         return result;
     }
 
+    //CPU cycle at which the $4016 strobe line was most recently asserted; used to
+    //work out whether the high period covered a "put" cycle. See cpuWrite's $4016 case.
+    private long strobeHighSince = 0;
+
+    private void latchControllers() {
+        controller1Shift = controller1;
+        controller2Shift = controller2;
+    }
+
     public void setController1(int buttons) {
         controller1 = buttons & 0xFF;
         if (controllerStrobe) controller1Shift = controller1;
@@ -109,8 +118,13 @@ public class Bus {
         else if (address >= 0x4000 && address <= 0x4015) {
             return apu.cpuRead(address);
         }
-        //6. Cartridge PRG ROM ($8000 - $FFFF). NROM has nothing mapped below $8000
-        //   (no PRG RAM), so $4018-$7FFF all fall through to open bus below.
+        //6. Cartridge PRG RAM ($6000-$7FFF, mapper 4/MMC3 boards only) and PRG ROM
+        //   ($8000-$FFFF). NROM has nothing mapped below $8000, so $4018-$5FFF
+        //   (and $6000-$7FFF on NROM carts, which have no PRG RAM) fall through to
+        //   open bus below.
+        else if (address >= 0x6000 && address <= 0x7FFF) {
+            if (cartridge != null && cartridge.getMapperID() == 4) return cartridge.cpuRead(address);
+        }
         else if (address >= 0x8000 && address <= 0xFFFF) {
             if (cartridge != null) return cartridge.cpuRead(address);
         }
@@ -150,11 +164,32 @@ public class Bus {
             //strobe state so the TAS Maker can tell whether a frame ever read input at
             //all, i.e. whether it was a "lag frame" the game didn't act on.
             if ((data & 0x01) != 0) strobedThisFrame = true;
-            controllerStrobe = (data & 0x01) != 0;
-            if (controllerStrobe) {
-                controller1Shift = controller1;
-                controller2Shift = controller2;
+            boolean nowHigh = (data & 0x01) != 0;
+            //The strobe line does not itself copy the buttons into the shift
+            //registers. It merely holds the parallel-load input asserted; the actual
+            //load happens on the CPU's "put" cycles while it is asserted. A normal
+            //`STA $4016` / `STA $4016` pair holds the line high for ~6 cycles, which
+            //always spans a put cycle, so it always latches. But `DEC $4016` holds it
+            //high for exactly one cycle, and then whether the controllers latch at
+            //all depends purely on whether that single cycle was a put or a get -
+            //which is exactly what AccuracyCoin's "Controller Strobing" tests 3 and 4
+            //check (test 3 lands on a put and must latch; test 4 lands on a get and
+            //must not).
+            //
+            //totalCycles has not yet been incremented for the cycle this write is
+            //happening on (see CPU.oamAlignRemaining's comment), so the write's own
+            //cycle number is totalCycles, and an even value is a put cycle.
+            if (nowHigh && !controllerStrobe) {
+                strobeHighSince = cpu.totalCycles;
+                if ((cpu.totalCycles & 1L) == 0) latchControllers();
+            } else if (!nowHigh && controllerStrobe) {
+                //Falling edge: the line was asserted for cycles [strobeHighSince,
+                //totalCycles-1]. If any of those was a put cycle, the registers were
+                //loaded at some point during the high period.
+                long first = strobeHighSince, last = cpu.totalCycles - 1;
+                if ((first & 1L) == 0 || last > first) latchControllers();
             }
+            controllerStrobe = nowHigh;
         }
         //5. APU & Direct I/O Registers ($4000 - $4015, $4017 frame counter)
         else if (address >= 0x4000 && address <= 0x4017) {
@@ -207,7 +242,7 @@ public class Bus {
         PPU.State ppu;
         APU.State apu;
         byte[] ram;
-        byte[] chr;
+        Cartridge.State cart;
         int controller1, controller2, controller1Shift, controller2Shift;
         boolean controllerStrobe;
         boolean strobedThisFrame;
@@ -219,7 +254,7 @@ public class Bus {
         s.ppu = ppu.snapshot();
         s.apu = apu.snapshot();
         s.ram = ram.clone();
-        s.chr = cartridge != null ? cartridge.snapshotChr() : null;
+        s.cart = cartridge != null ? cartridge.snapshot() : null;
         s.controller1 = controller1; s.controller2 = controller2;
         s.controller1Shift = controller1Shift; s.controller2Shift = controller2Shift;
         s.controllerStrobe = controllerStrobe;
@@ -232,7 +267,7 @@ public class Bus {
         ppu.restore(s.ppu);
         apu.restore(s.apu);
         System.arraycopy(s.ram, 0, ram, 0, ram.length);
-        if (cartridge != null && s.chr != null) cartridge.restoreChr(s.chr);
+        if (cartridge != null && s.cart != null) cartridge.restore(s.cart);
         controller1 = s.controller1; controller2 = s.controller2;
         controller1Shift = s.controller1Shift; controller2Shift = s.controller2Shift;
         controllerStrobe = s.controllerStrobe;
@@ -246,5 +281,16 @@ public class Bus {
 
     public void ppuWriteCartridge(int address, byte data) {
         if (cartridge != null) cartridge.ppuWrite(address, data);
+    }
+
+    public Cartridge.MirrorMode getMirrorMode() {
+        return cartridge != null ? cartridge.getMirrorMode() : Cartridge.MirrorMode.VERTICAL;
+    }
+
+    //Called once per scanline by the PPU (see PPU.step()) to drive a mapper's own
+    //scanline-based IRQ counter (currently just MMC3/mapper 4) - a no-op for any
+    //other mapper.
+    public void clockMapperIRQ() {
+        if (cartridge != null) cartridge.clockMapperIRQ();
     }
 }

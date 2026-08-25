@@ -12,6 +12,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 public class NESEmulator extends JFrame implements Runnable {
 
@@ -124,6 +125,18 @@ public class NESEmulator extends JFrame implements Runnable {
     //trade memory for a longer worst-case replay-to-target after a backward seek.
     private int tasSavestateInterval = 1;
     private JDialog tasSettingsDialog;
+
+    //Frame index -> marker name ("" for an unlabeled marker). Markers paint their
+    //row yellow (see tasRowColor) and let the user fast-travel via the Markers
+    //dialog (openMarkersDialog) or jump the selection boundary via "Select Between
+    //Markers" (selectBetweenMarkers).
+    private final TreeMap<Integer, String> tasMarkers = new TreeMap<>();
+    private JDialog tasMarkersDialog;
+    //Copy/paste clipboard for the frame timeline: a snapshot of controller bitmasks
+    //(not a live view of tasInputs), populated by copySelectedFrames and consumed by
+    //pasteFrames.
+    private List<Integer> tasClipboard = null;
+    private JPopupMenu tasContextMenu;
 
     public NESEmulator() {
         super("NESEmulator");
@@ -291,13 +304,16 @@ public class NESEmulator extends JFrame implements Runnable {
     private static final Color TAS_LAG_FRAME_COLOR = new Color(0xF4A0A0);      //red: emulated, controllers never strobed
     private static final Color TAS_NORMAL_FRAME_COLOR = new Color(0xA8E6A8);   //green: emulated, controllers strobed
     private static final Color TAS_UNEMULATED_COLOR = Color.WHITE;             //past tasValidFrontier: no savestate yet
+    private static final Color TAS_MARKER_COLOR = Color.YELLOW;                //marked frame - takes priority over validity coloring
 
-    //Shared by both TAS table cell renderers: a row past tasValidFrontier has never
-    //been (re-)emulated against the movie's current contents, so it gets the plain
+    //Shared by both TAS table cell renderers: a marked frame is always yellow
+    //regardless of validity. Otherwise a row past tasValidFrontier has never been
+    //(re-)emulated against the movie's current contents, so it gets the plain
     //default look; otherwise it's colored by whether that frame's playthrough ever
     //strobed the controller (see tasFrameStrobed/Bus.consumeStrobedThisFrame) - an
     //emulated-but-unstrobed frame is a "lag frame" the game didn't act on.
     private Color tasRowColor(int row) {
+        if (tasMarkers.containsKey(row)) return TAS_MARKER_COLOR;
         if (row >= tasValidFrontier) return TAS_UNEMULATED_COLOR;
         boolean strobed = row < tasFrameStrobed.size() && tasFrameStrobed.get(row);
         return strobed ? TAS_NORMAL_FRAME_COLOR : TAS_LAG_FRAME_COLOR;
@@ -412,6 +428,14 @@ public class NESEmulator extends JFrame implements Runnable {
         insertButton.addActionListener(e -> insertTasFrames());
         topPanel.add(insertButton);
 
+        JButton markersButton = new JButton("Markers");
+        markersButton.addActionListener(e -> openMarkersDialog());
+        topPanel.add(markersButton);
+
+        JButton addInputsButton = new JButton("Add Inputs");
+        addInputsButton.addActionListener(e -> showAddInputsMenu(addInputsButton));
+        topPanel.add(addInputsButton);
+
         JButton saveButton = new JButton("Save TAS...");
         saveButton.addActionListener(e -> saveTas());
         topPanel.add(saveButton);
@@ -433,11 +457,19 @@ public class NESEmulator extends JFrame implements Runnable {
         //if the mouse's X strays off that column (over the buttons, or out of the
         //table entirely) as long as the button stays held - matching how dragging
         //normally behaves in other apps once you've grabbed a handle.
+        //JTable's own mouse handling (BasicTableUI) only ever drives changeSelection
+        //for the LEFT button - a right-button press/drag never reaches it at all, so
+        //this path is exclusively the left-click/left-drag "follow the cursor" scrub
+        //behavior. Forcing extend=false here (regardless of what JTable computed) is
+        //what keeps a left-drag from turning into a multi-row range selection - it
+        //always just moves the single-row selection (and playhead) to match the
+        //cursor. Right-drag range-highlighting is handled separately, directly
+        //against the selection model, in the mouse listener below.
         tasTable = new JTable(tasTableModel) {
             @Override
             public void changeSelection(int rowIndex, int columnIndex, boolean toggle, boolean extend) {
                 if (columnIndex != 0 && !tasFrameColumnDragging) return;
-                super.changeSelection(rowIndex, 0, toggle, extend);
+                super.changeSelection(rowIndex, 0, false, false);
             }
         };
         tasTable.setRowHeight(20);
@@ -447,17 +479,26 @@ public class NESEmulator extends JFrame implements Runnable {
         for (int i = 1; i <= TAS_BUTTON_BITS.length; i++) {
             tasTable.getColumnModel().getColumn(i).setPreferredWidth(50);
         }
-        tasTable.getSelectionModel().setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
-        //Clicking OR dragging across rows (while paused) scrubs playback live, frame
-        //by frame, the way FCEUX/BizHawk's TAS editors let you drag until you spot
-        //something specific on screen - so this intentionally does NOT skip
-        //e.getValueIsAdjusting() events, only Play (which is moving the selection
-        //programmatically every frame already) and the programmatic selection
-        //syncTasSelection() itself makes.
+        //Left click/drag on the Frame# column scrubs the playhead one row at a time
+        //(see changeSelection above), always ending on a single-row selection. Right
+        //click+drag instead range-selects (blue highlight) for clipboard/marker/
+        //add-inputs operations, without moving the playhead - so the playhead only
+        //follows when the selection resolves to exactly one row.
+        tasTable.getSelectionModel().setSelectionMode(javax.swing.ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        //Deliberately does NOT skip e.getValueIsAdjusting() events - a left-drag scrub
+        //needs to seek on every intermediate row the cursor passes over, not just once
+        //on release. Right-drag range-selection never reaches this at all (it's done
+        //with suppressTasSelectionEvents held true), so it's never mistaken for a scrub.
         tasTable.getSelectionModel().addListSelectionListener(e -> {
             if (tasPlaying || suppressTasSelectionEvents) return;
-            int row = tasTable.getSelectedRow();
-            if (row >= 0) seekToFrame(row + 1);
+            int[] rows = tasTable.getSelectedRows();
+            if (rows.length == 1) seekToFrame(rows[0] + 1);
+        });
+
+        tasContextMenu = buildTasContextMenu();
+        tasTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mousePressed(java.awt.event.MouseEvent e) { maybeShowTasContextMenu(e); }
+            @Override public void mouseReleased(java.awt.event.MouseEvent e) { maybeShowTasContextMenu(e); }
         });
 
         //Tracks whether the current drag started on the Frame# column, so
@@ -471,6 +512,49 @@ public class NESEmulator extends JFrame implements Runnable {
 
             @Override public void mouseReleased(java.awt.event.MouseEvent e) {
                 if (javax.swing.SwingUtilities.isLeftMouseButton(e)) tasFrameColumnDragging = false;
+            }
+        });
+
+        //Right click+drag range-selects (blue highlight) instead of scrubbing -
+        //handled directly against the selection model since JTable's own mouse
+        //handling (and therefore changeSelection above) never sees right-button
+        //events at all. A right press that never turns into a drag just leaves the
+        //single row under the cursor selected, so a plain right-click still acts on
+        //one frame via the context menu (see maybeShowTasContextMenu).
+        tasTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mousePressed(java.awt.event.MouseEvent e) {
+                if (!javax.swing.SwingUtilities.isRightMouseButton(e)) return;
+                int row = tasTable.rowAtPoint(e.getPoint());
+                if (row < 0) { tasRightDragAnchor = -1; return; }
+                tasRightDragAnchor = row;
+                suppressTasSelectionEvents = true;
+                try {
+                    tasTable.setRowSelectionInterval(row, row);
+                } finally {
+                    suppressTasSelectionEvents = false;
+                }
+            }
+
+            @Override public void mouseReleased(java.awt.event.MouseEvent e) {
+                if (javax.swing.SwingUtilities.isRightMouseButton(e)) tasRightDragAnchor = -1;
+            }
+        });
+        tasTable.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
+            @Override public void mouseDragged(java.awt.event.MouseEvent e) {
+                if (tasRightDragAnchor < 0) return;
+                int row = tasTable.rowAtPoint(e.getPoint());
+                if (row < 0) {
+                    Rectangle visible = tasTable.getVisibleRect();
+                    row = e.getY() < visible.y ? 0 : tasTableModel.getRowCount() - 1;
+                }
+                if (row < 0 || row >= tasTableModel.getRowCount()) return;
+                suppressTasSelectionEvents = true;
+                try {
+                    tasTable.setRowSelectionInterval(Math.min(tasRightDragAnchor, row), Math.max(tasRightDragAnchor, row));
+                } finally {
+                    suppressTasSelectionEvents = false;
+                }
+                tasTable.repaint();
             }
         });
 
@@ -606,6 +690,9 @@ public class NESEmulator extends JFrame implements Runnable {
     //Whether the in-progress mouse drag started on the Frame# column; see the
     //changeSelection override in createTASMakerWindow.
     private boolean tasFrameColumnDragging = false;
+    //Anchor row of an in-progress right-button drag-select on the Frame# column, or
+    //-1 when no right-drag is active; see the mouse listeners in createTASMakerWindow.
+    private int tasRightDragAnchor = -1;
     private Integer tasPaintColumn = null;
     private boolean tasPaintValue;
     private int tasPaintLastRow = -1;
@@ -851,9 +938,33 @@ public class NESEmulator extends JFrame implements Runnable {
         }
         if (count <= 0) return;
 
-        int selected = tasTable.getSelectedRow();
+        int selected = tasSelectionAnchor();
         int insertPos = (selected >= 0) ? selected + 1 : tasInputs.size();
-        for (int i = 0; i < count; i++) tasInputs.add(insertPos, 0);
+        insertBlankFramesAt(insertPos, count);
+    }
+
+    private void insertOneTasFrame() {
+        int selected = tasSelectionAnchor();
+        int insertPos = (selected >= 0) ? selected + 1 : tasInputs.size();
+        insertBlankFramesAt(insertPos, 1);
+    }
+
+    //Shared by "Insert", "Insert Frames...", and paste-insert: splices `count` blank
+    //(no-input) frames into tasInputs at insertPos, pushing every existing frame at
+    //or after insertPos forward, then fixes up validity/checkpoints/markers/playhead
+    //to match. See insertClipboardAt for the copied-frames equivalent.
+    private void insertBlankFramesAt(int insertPos, int count) {
+        List<Integer> blanks = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) blanks.add(0);
+        insertFramesAt(insertPos, blanks);
+    }
+
+    //Splices `frames` into tasInputs at insertPos, pushing every existing frame at or
+    //after insertPos forward by frames.size(). Shared by blank inserts and paste-insert.
+    private void insertFramesAt(int insertPos, List<Integer> frames) {
+        if (frames.isEmpty()) return;
+        tasInputs.addAll(insertPos, frames);
+        shiftMarkersFrom(insertPos, frames.size());
         //Every frame index at/after insertPos now refers to different content than
         //whatever (if anything) was previously validated there, so nothing from
         //insertPos on can still be trusted as "emulated" - the rows themselves just
@@ -874,6 +985,235 @@ public class NESEmulator extends JFrame implements Runnable {
         } else {
             syncTasSelection();
         }
+    }
+
+    //Shifts every marker at/after `pos` by `delta` rows - used whenever frames are
+    //spliced into (or, in principle, removed from) the timeline so markers keep
+    //pointing at the same logical frame instead of the same row index.
+    private void shiftMarkersFrom(int pos, int delta) {
+        if (tasMarkers.isEmpty() || delta == 0) return;
+        TreeMap<Integer, String> shifted = new TreeMap<>();
+        for (Map.Entry<Integer, String> entry : tasMarkers.entrySet()) {
+            int key = entry.getKey();
+            shifted.put(key >= pos ? key + delta : key, entry.getValue());
+        }
+        tasMarkers.clear();
+        tasMarkers.putAll(shifted);
+    }
+
+    //The row clipboard/insert/marker operations anchor on: the lowest selected row,
+    //or -1 if nothing is selected (meaning "at the end"/"none").
+    private int tasSelectionAnchor() {
+        int[] rows = tasTable.getSelectedRows();
+        if (rows.length == 0) return -1;
+        int min = rows[0];
+        for (int r : rows) min = Math.min(min, r);
+        return min;
+    }
+
+    private JPopupMenu buildTasContextMenu() {
+        JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem copyItem = new JMenuItem("Copy");
+        copyItem.addActionListener(e -> copySelectedTasFrames());
+        menu.add(copyItem);
+
+        JMenuItem pasteItem = new JMenuItem("Paste");
+        pasteItem.addActionListener(e -> pasteTasFrames(false));
+        menu.add(pasteItem);
+
+        JMenuItem pasteInsertItem = new JMenuItem("Paste Insert");
+        pasteInsertItem.addActionListener(e -> pasteTasFrames(true));
+        menu.add(pasteInsertItem);
+
+        menu.addSeparator();
+
+        JMenuItem insertItem = new JMenuItem("Insert");
+        insertItem.addActionListener(e -> insertOneTasFrame());
+        menu.add(insertItem);
+
+        JMenuItem insertCountItem = new JMenuItem("Insert # of Frames...");
+        insertCountItem.addActionListener(e -> insertTasFrames());
+        menu.add(insertCountItem);
+
+        menu.addSeparator();
+
+        JMenuItem addMarkerItem = new JMenuItem("Add Marker");
+        addMarkerItem.addActionListener(e -> addTasMarker(false));
+        menu.add(addMarkerItem);
+
+        JMenuItem addLabeledMarkerItem = new JMenuItem("Add Labeled Marker");
+        addLabeledMarkerItem.addActionListener(e -> addTasMarker(true));
+        menu.add(addLabeledMarkerItem);
+
+        menu.addSeparator();
+
+        JMenuItem selectBetweenMarkersItem = new JMenuItem("Select Between Markers");
+        selectBetweenMarkersItem.addActionListener(e -> selectBetweenMarkers());
+        menu.add(selectBetweenMarkersItem);
+
+        return menu;
+    }
+
+    //Right-clicking a row that isn't already part of the current selection selects
+    //just that row first (so right-clicking a single frame acts on that frame), but
+    //right-clicking inside an existing multi-row selection leaves it alone - that's
+    //what lets you drag-highlight a group, then right-click within it to copy the
+    //whole group.
+    private void maybeShowTasContextMenu(java.awt.event.MouseEvent e) {
+        if (!e.isPopupTrigger()) return;
+        int row = tasTable.rowAtPoint(e.getPoint());
+        if (row >= 0) {
+            boolean alreadySelected = false;
+            for (int r : tasTable.getSelectedRows()) if (r == row) { alreadySelected = true; break; }
+            if (!alreadySelected) tasTable.setRowSelectionInterval(row, row);
+        }
+        tasContextMenu.show(tasTable, e.getX(), e.getY());
+    }
+
+    //Snapshots the controller bitmask of every currently selected frame (in ascending
+    //row order) into tasClipboard.
+    private void copySelectedTasFrames() {
+        int[] rows = tasTable.getSelectedRows().clone();
+        Arrays.sort(rows);
+        if (rows.length == 0) return;
+        List<Integer> copied = new ArrayList<>(rows.length);
+        for (int r : rows) copied.add(tasInputs.get(r));
+        tasClipboard = copied;
+    }
+
+    //Paste (overwrite): replaces frames starting at the selection anchor with the
+    //clipboard contents in place - extending the movie if the clipboard runs past
+    //its current end - without shifting anything else.
+    //Paste Insert: splices the clipboard's frames in at the anchor, pushing every
+    //existing frame at/after it forward (like insertFramesAt).
+    private void pasteTasFrames(boolean insert) {
+        if (tasClipboard == null || tasClipboard.isEmpty()) return;
+        int anchor = tasSelectionAnchor();
+        int pos = (anchor >= 0) ? anchor : tasInputs.size();
+
+        if (insert) {
+            insertFramesAt(pos, new ArrayList<>(tasClipboard));
+            return;
+        }
+
+        int firstOverwritten = pos;
+        for (int i = 0; i < tasClipboard.size(); i++) {
+            int idx = pos + i;
+            if (idx < tasInputs.size()) tasInputs.set(idx, tasClipboard.get(i));
+            else tasInputs.add(tasClipboard.get(i));
+        }
+        if (firstOverwritten < tasValidFrontier) {
+            tasValidFrontier = firstOverwritten;
+            invalidateTasCheckpointsFrom(tasValidFrontier);
+        }
+        tasTableModel.fireTableDataChanged();
+        if (firstOverwritten < tasFrame) {
+            seekToFrame(firstOverwritten);
+        } else {
+            syncTasSelection();
+        }
+    }
+
+    //Marks the selected (single) frame with a marker - unlabeled, or prompting for a
+    //name when `labeled` is true. Adding a marker to an already-marked frame just
+    //replaces its label.
+    private void addTasMarker(boolean labeled) {
+        int row = tasTable.getSelectedRow();
+        if (row < 0 || row >= tasInputs.size()) return;
+        String name = "";
+        if (labeled) {
+            String input = JOptionPane.showInputDialog(tasDialog, "Marker name:", "");
+            if (input == null) return;
+            name = input.trim();
+        }
+        tasMarkers.put(row, name);
+        tasTableModel.fireTableRowsUpdated(row, row);
+        tasTable.repaint();
+    }
+
+    //Extends the selection backward from the anchor frame to (and including) the
+    //nearest earlier marker, or frame 0 if there is none, and forward from the
+    //anchor to (but excluding) the nearest later marker, or the last frame if there
+    //is none.
+    private void selectBetweenMarkers() {
+        int anchor = tasTable.getSelectedRow();
+        if (anchor < 0 || tasInputs.isEmpty()) return;
+
+        Integer backMarker = tasMarkers.floorKey(anchor - 1);
+        int start = (backMarker != null) ? backMarker : 0;
+
+        Integer forwardMarker = tasMarkers.ceilingKey(anchor + 1);
+        int end = (forwardMarker != null) ? forwardMarker - 1 : tasInputs.size() - 1;
+
+        if (end < start) end = start;
+        suppressTasSelectionEvents = true;
+        try {
+            tasTable.setRowSelectionInterval(start, end);
+        } finally {
+            suppressTasSelectionEvents = false;
+        }
+        tasTable.repaint();
+    }
+
+    //Toggles one controller button across every selected frame: if every selected
+    //frame already has that button pressed, it's cleared from all of them; otherwise
+    //it's set on all of them (matching how DAW/TAS-editor "stamp" tools usually work).
+    private void toggleInputOnSelection(int bit) {
+        int[] rows = tasTable.getSelectedRows();
+        if (rows.length == 0) return;
+        boolean allSet = true;
+        for (int r : rows) {
+            if ((tasInputs.get(r) & bit) == 0) { allSet = false; break; }
+        }
+        boolean newValue = !allSet;
+        for (int r : rows) editFrameInput(r, bit, newValue);
+    }
+
+    private void showAddInputsMenu(Component invoker) {
+        JPopupMenu menu = new JPopupMenu();
+        for (int i = 0; i < TAS_BUTTON_NAMES.length; i++) {
+            int bit = TAS_BUTTON_BITS[i];
+            JMenuItem item = new JMenuItem(TAS_BUTTON_NAMES[i]);
+            item.addActionListener(e -> toggleInputOnSelection(bit));
+            menu.add(item);
+        }
+        menu.show(invoker, 0, invoker.getHeight());
+    }
+
+    //Lists every marker (frame number + name) and fast-travels the playhead/selection
+    //to whichever one is clicked.
+    private void openMarkersDialog() {
+        if (tasMarkersDialog == null) {
+            tasMarkersDialog = new JDialog(tasDialog, "Markers", false);
+            tasMarkersDialog.setLayout(new BorderLayout());
+            tasMarkersDialog.setSize(300, 400);
+        } else {
+            tasMarkersDialog.getContentPane().removeAll();
+        }
+
+        DefaultListModel<String> listModel = new DefaultListModel<>();
+        List<Integer> frames = new ArrayList<>(tasMarkers.keySet());
+        for (int frame : frames) {
+            String name = tasMarkers.get(frame);
+            listModel.addElement("Frame " + frame + (name != null && !name.isEmpty() ? "  -  " + name : ""));
+        }
+        JList<String> list = new JList<>(listModel);
+        list.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                if (e.getClickCount() < 2) return;
+                int idx = list.locationToIndex(e.getPoint());
+                if (idx < 0 || idx >= frames.size()) return;
+                int frame = frames.get(idx);
+                seekToFrame(frame + 1);
+            }
+        });
+
+        tasMarkersDialog.add(new JScrollPane(list), BorderLayout.CENTER);
+        tasMarkersDialog.add(new JLabel("Double-click a marker to jump to it", SwingConstants.CENTER), BorderLayout.SOUTH);
+        tasMarkersDialog.revalidate();
+        tasMarkersDialog.setLocationRelativeTo(tasDialog);
+        tasMarkersDialog.setVisible(true);
     }
 
     //Saves just the movie itself - the per-frame controller 1 bitmask list - as one
@@ -926,6 +1266,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasValidFrontier = 0;
         tasFrame = 0;
         tasCheckpoints.clear();
+        tasMarkers.clear();
         bus.hardReset();
         displayPanel.renderFrame();
         tasTableModel.fireTableDataChanged();
@@ -1109,6 +1450,52 @@ public class NESEmulator extends JFrame implements Runnable {
         memoryInspector.addActionListener(e -> memoryDialog.setVisible(true));
         debugMenu.add(memoryInspector);
 
+        //Prints every live OAM entry (index/Y/tile/attr/X, decoded priority+flip+
+        //palette bits) to stdout and a copyable dialog - meant to be used paused,
+        //right when a sprite-rendering bug is visible on screen, so the exact OAM
+        //state behind it can be reported without needing a debugger attached.
+        JMenuItem dumpOamItem = new JMenuItem("Dump OAM");
+        dumpOamItem.addActionListener(e -> {
+            String text = ppu.dumpOamText();
+            System.out.println("=== OAM dump (frame paused) ===\n" + text);
+            JTextArea area = new JTextArea(text, 24, 48);
+            area.setEditable(false);
+            area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+            JOptionPane.showMessageDialog(this, new JScrollPane(area), "OAM Dump", JOptionPane.PLAIN_MESSAGE);
+        });
+        debugMenu.add(dumpOamItem);
+
+        //Arms a one-shot click on the game display: translates the click into NES
+        //pixel coordinates (accounting for the panel's current scale) and shows
+        //exactly why that pixel is the color it is - background opacity, every
+        //sprite covering that column on that scanline, and which one (if any) won.
+        //Meant to be used paused, right on a frame showing a suspicious sprite/
+        //priority rendering bug, so it can be diagnosed by clicking on it directly.
+        JMenuItem explainPixelItem = new JMenuItem("Explain Pixel (click screen)...");
+        explainPixelItem.addActionListener(e -> {
+            JOptionPane.showMessageDialog(this, "Click anywhere on the game screen to explain that pixel.",
+                    "Explain Pixel", JOptionPane.INFORMATION_MESSAGE);
+            displayPanel.addMouseListener(new java.awt.event.MouseAdapter() {
+                @Override public void mouseClicked(java.awt.event.MouseEvent ev) {
+                    displayPanel.removeMouseListener(this);
+                    int nx = ev.getX() * NESDisplayPanel.VIEW_WIDTH / Math.max(1, displayPanel.getWidth());
+                    int ny = ev.getY() * NESDisplayPanel.VIEW_HEIGHT / Math.max(1, displayPanel.getHeight());
+                    //Shows a 24x24 ASCII grid centered on the click (see explainGrid's
+                    //own comment) - imprecise since a 1:1 click-to-pixel mapping across
+                    //a scaled display isn't exact, but the grid is wide enough that the
+                    //area of interest lands somewhere in it regardless.
+                    int gx0 = Math.max(0, nx - 12), gy0 = Math.max(0, ny - 12);
+                    String text = String.format("clicked (%d,%d)%n%n", nx, ny) + ppu.explainGrid(gx0, gy0, 24, 24);
+                    System.out.println(text);
+                    JTextArea area = new JTextArea(text, 28, 40);
+                    area.setEditable(false);
+                    area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+                    JOptionPane.showMessageDialog(NESEmulator.this, new JScrollPane(area), "Explain Pixel", JOptionPane.PLAIN_MESSAGE);
+                }
+            });
+        });
+        debugMenu.add(explainPixelItem);
+
         //attach menus to bar
 
         menuBar.add(emulationMenu);
@@ -1263,6 +1650,7 @@ public class NESEmulator extends JFrame implements Runnable {
             File selectedFile = fileChooser.getSelectedFile();
             try {
                 Cartridge cart = new Cartridge(selectedFile);
+                cart.connectCPU(cpu);
                 bus.insertCartridge(cart);
                 bus.reset();
                 System.out.println("Successfully loaded ROM: " + selectedFile.getName());
