@@ -2,46 +2,63 @@ public class PPU {
 
     public static boolean DEBUG_SPRITE0 = false;
 
-    //How many PPU dots from right now until the pre-render line's flag-clear point
-    //(scanline 261, dot 0), or a large number if that point has already passed this
-    //frame. Used only by the $2002 read path to model the ~2-dot sampling skew
-    //between the latched VBlank flag and the unlatched sprite flags.
+    //$2002 read: CPU's M2 samples VBlank and sprite flags at different points within
+    //the cycle. VBlank latches when M2 rises; sprite 0 hit/overflow read off the
+    //flip-flops when M2 falls, ~1.875 dots later. AccuracyCoin "$2002 Flag Timing"
+    //test 1 measures this skew. dotsUntilPreRenderFlagClear() below reports dots left
+    //until the pre-render clear, so sprite bits see it iff within the falling-edge lookahead.
+    private static final int M2_FALL_LOOKAHEAD_DOTS = 2; //sprite flags: sampled at M2's falling edge
+
+    //VBlank/sprite0hit/overflow all clear together on dot 1 of pre-render (scanline 261).
     private int dotsUntilPreRenderFlagClear() {
-        if (scanline == 261 && cycle == 0) return 0;
-        if (scanline == 260) return 341 - cycle;
+        if (scanline == 261 && cycle == 0) return 1;
+        if (scanline == 260) return (341 - cycle) + 1;
         return Integer.MAX_VALUE;
     }
 
-    //Debug-only: records, live as each pixel actually renders, whether the
-    //background was opaque there and which OAM index (if any) won the pixel - see
-    //renderPixel()'s recording line at the bottom and explainGrid()'s use of these.
-    //MMC3 games routinely swap CHR banks mid-frame (e.g. SMB3's status-bar split),
-    //so re-deriving a paused frame's content from scratch afterward would use
-    //whatever CHR bank happened to be selected LAST, not the bank each scanline
-    //actually used when it rendered - silently producing wrong (often blank)
-    //pattern data for every row except the last one written. Recording the real,
-    //historically-correct decision at the moment it's made avoids that entirely.
+    //Frame parity for pre-render's odd-frame dot skip - see step().
+    private boolean oddFrame = false;
+
+    //Debug-only: records per-pixel bg-opaque/winning-OAM state live as each pixel
+    //renders, since MMC3 mid-frame CHR bank swaps (e.g. SMB3 status bar) make
+    //re-deriving a paused frame's content afterward use the wrong (last-selected) bank.
     private final boolean[] debugBgOpaque = new boolean[256 * 240];
     private final int[] debugWinnerOam = new int[256 * 240]; //-1 = background/backdrop won
 
     // Standard NES System Palette (64 Colors)
-    public static final int[] NES_PALETTE = {
-            0x7C7C7C, 0x002492, 0x0000DB, 0x6800D4, 0x7C00A0, 0x6C0040, 0x5C0000, 0x501800,
-            0x3C2400, 0x004000, 0x003C00, 0x00382C, 0x002C7C, 0x000000, 0x000000, 0x000000,
-            0xBCBCBC, 0x0073F8, 0x0050F8, 0x6B00F8, 0x9B00F8, 0xAE00B8, 0xB7004C, 0x980000,
-            0x703800, 0x006C00, 0x006C00, 0x006000, 0x00501C, 0x000000, 0x000000, 0x000000,
-            0xF8F8F8, 0x3CBCFC, 0x6888FC, 0x9878FC, 0xD878FC, 0xF878F8, 0xF85898, 0xF87858,
-            0xF8A000, 0x00B800, 0x00F800, 0x00F878, 0x00F8D8, 0x000000, 0x000000, 0x000000,
-            0xF8F8F8, 0xA4E4FC, 0xB8B8FC, 0xD8B8FC, 0xF8B8FC, 0xF8B8F8, 0xF8A4C0, 0xF0D0B0,
-            0xFCE0A8, 0xB8F8B8, 0xB8F8D8, 0x00F8F8, 0x00D8F8, 0x000000, 0x000000, 0x000000
+    //PPUMASK bits 7-6-5 select one of 8 emphasis sets; the DAC tints the whole
+    //picture, so each combination is its own real 64-color table, not a shared table
+    //plus a multiplier. Row = (ppumask>>5)&0x07, bit0=R/bit1=G/bit2=B - see
+    //currentPalette(). Values measured off real NTSC RP2C02 (res/nes_palette_hex.txt).
+    public static final int[][] EMPHASIS_PALETTE = {
+        { 0x575757, 0x000C8E, 0x0800A6, 0x340096, 0x550061, 0x630015, 0x5A0000, 0x3C0E00, 0x112800, 0x003B00, 0x004200, 0x003A05, 0x002652, 0x000000, 0x000000, 0x000000, 0xA5A5A5, 0x0041D9, 0x2F1EFF, 0x6704F2, 0x9400B4, 0xAA0057, 0xA31800, 0x803900, 0x4B5B00, 0x137600, 0x008100, 0x007923, 0x006288, 0x000000, 0x000000, 0x000000, 0xFFFFFF, 0x4A9FFF, 0x797EFF, 0xAF63FF, 0xDD55FF, 0xF757C2, 0xF76A63, 0xDC8810, 0xAEA900, 0x78C400, 0x4AD211, 0x2FCF64, 0x2FBDC4, 0x414141, 0x000000, 0x000000, 0xFFFFFF, 0xB9DDFF, 0xCAD1FF, 0xDEC6FF, 0xF0C0FF, 0xFCC0EE, 0xFDC6CA, 0xF5D0AA, 0xE4DD95, 0xD0E892, 0xBDEEA2, 0xB2EEC0, 0xB0E8E3, 0xB3B3B3, 0x000000, 0x000000 },
+        { 0x593A32, 0x000065, 0x0A007C, 0x33006E, 0x530040, 0x610000, 0x590000, 0x3C0200, 0x131800, 0x002700, 0x002A00, 0x002100, 0x000E31, 0x000000, 0x000000, 0x000000, 0xA67A77, 0x0022A8, 0x3205CB, 0x6700C0, 0x920089, 0xA80035, 0xA10800, 0x7F2700, 0x4C4400, 0x155A00, 0x006000, 0x005707, 0x004061, 0x000000, 0x000000, 0x000000, 0xFDCACE, 0x5175E6, 0x7E58FF, 0xB140FF, 0xDD35E1, 0xF63A93, 0xF44C3A, 0xD96800, 0xAC8600, 0x789D00, 0x4CA800, 0x34A342, 0x36919B, 0x43271E, 0x000000, 0x000000, 0xFDCACE, 0xBBACD5, 0xCBA0E7, 0xDF96E9, 0xF091D9, 0xFB92BC, 0xFB9799, 0xF2A27C, 0xE2AE69, 0xCFB867, 0xBDBD77, 0xB3BC94, 0xB2B7B7, 0xB48785, 0x000000, 0x000000 },
+        { 0x2F5127, 0x000869, 0x00007B, 0x150068, 0x310036, 0x3D0000, 0x360000, 0x1D0C00, 0x002600, 0x003900, 0x004000, 0x003700, 0x002336, 0x000000, 0x000000, 0x000000, 0x709B5F, 0x003AA7, 0x0F19C5, 0x4000B3, 0x670079, 0x7A0024, 0x741600, 0x563600, 0x285800, 0x007200, 0x007C00, 0x007406, 0x005C61, 0x000000, 0x000000, 0x000000, 0xC3EFA9, 0x2394D6, 0x4E74FE, 0x7F5AF9, 0xA94ECA, 0xC0517A, 0xBF6423, 0xA68200, 0x7CA200, 0x4BBC00, 0x20C800, 0x09C533, 0x0AB28C, 0x1C3C16, 0x000000, 0x000000, 0xC3EFA9, 0x83CFB5, 0x93C3C7, 0xA6B9C9, 0xB7B4B9, 0xC1B49C, 0xC2BA7A, 0xBAC55C, 0xAAD14A, 0x97DB48, 0x85E058, 0x7BE075, 0x7ADA97, 0x7DA86B, 0x000000, 0x000000 },
+        { 0x363820, 0x00005B, 0x00006D, 0x1A005D, 0x34002F, 0x400000, 0x390000, 0x200000, 0x001600, 0x002500, 0x002900, 0x002000, 0x000D2C, 0x000000, 0x000000, 0x000000, 0x78785A, 0x002199, 0x1705B6, 0x4600A6, 0x6C006F, 0x7E001D, 0x770800, 0x592500, 0x2C4200, 0x005700, 0x005F00, 0x005501, 0x003F57, 0x000000, 0x000000, 0x000000, 0xC8C6A6, 0x2E72CD, 0x5855F2, 0x883EED, 0xB134BE, 0xC63972, 0xC34B1E, 0xAA6700, 0x808400, 0x509B00, 0x27A500, 0x12A131, 0x158E85, 0x23250F, 0x000000, 0x000000, 0xC8C6A6, 0x8BA8B1, 0x9B9CC2, 0xAD93C3, 0xBE8EB2, 0xC78F96, 0xC79576, 0xBF9F59, 0xAFAB47, 0x9CB447, 0x8BB957, 0x82B973, 0x82B394, 0x858567, 0x000000, 0x000000 },
+        { 0x3F3C6E, 0x000097, 0x0200AE, 0x29009C, 0x450068, 0x4E0020, 0x420000, 0x250000, 0x001100, 0x002200, 0x002900, 0x002417, 0x00145F, 0x000000, 0x000000, 0x000000, 0x7F80BF, 0x002CE7, 0x230DFF, 0x5600FA, 0x7D00BD, 0x8D0063, 0x820304, 0x5F2000, 0x2E3E00, 0x005600, 0x006100, 0x005C3E, 0x00499C, 0x000000, 0x000000, 0x000000, 0xCED4FF, 0x347FFF, 0x6060FF, 0x9247FF, 0xBC3AFF, 0xD23CD1, 0xCE4D76, 0xB2682A, 0x868701, 0x549F04, 0x2BAC35, 0x15AB85, 0x189AE0, 0x2C2856, 0x000000, 0x000000, 0xCED4FF, 0x90B5FF, 0xA0A9FF, 0xB49FFF, 0xC599FF, 0xCF99FF, 0xCF9FE1, 0xC6AAC2, 0xB6B6B0, 0xA3C0AE, 0x92C5BF, 0x88C5DC, 0x87BFFE, 0x8C8ECC, 0x000000, 0x000000 },
+        { 0x3E2E42, 0x00006D, 0x010082, 0x260074, 0x410047, 0x4B0007, 0x410000, 0x240000, 0x000C00, 0x001B00, 0x002000, 0x001900, 0x00083A, 0x000000, 0x000000, 0x000000, 0x806B87, 0x001BB3, 0x2300D3, 0x5400C6, 0x790090, 0x8A003E, 0x800000, 0x5E1A00, 0x2E3600, 0x004B00, 0x005300, 0x004C18, 0x00376E, 0x000000, 0x000000, 0x000000, 0xCEB9D9, 0x3768F4, 0x624CFF, 0x9335FF, 0xBB2AE9, 0xD02D9C, 0xCB3F45, 0xB05A00, 0x857700, 0x548D00, 0x2C980A, 0x189556, 0x1C83AD, 0x2B1C2D, 0x000000, 0x000000, 0xCEB9D9, 0x929BE2, 0xA190F2, 0xB586F3, 0xC581E3, 0xCF82C7, 0xCE88A5, 0xC69289, 0xB69E78, 0xA3A777, 0x92AC87, 0x89ACA3, 0x89A5C6, 0x8C7894, 0x000000, 0x000000 },
+        { 0x2A393D, 0x000070, 0x000082, 0x15006F, 0x30003D, 0x3A0000, 0x310000, 0x170000, 0x001100, 0x002200, 0x002900, 0x002201, 0x001241, 0x000000, 0x000000, 0x000000, 0x667A7D, 0x0027B4, 0x0F09D0, 0x3F00BE, 0x640084, 0x740032, 0x6B0400, 0x4D2000, 0x1F3E00, 0x005500, 0x005F00, 0x00591D, 0x004472, 0x000000, 0x000000, 0x000000, 0xB2CAC9, 0x2077EE, 0x4B59FF, 0x7A41FF, 0xA136DD, 0xB6398F, 0xB34A3B, 0x996600, 0x6F8400, 0x3F9B00, 0x18A705, 0x03A452, 0x0693A7, 0x18262A, 0x000000, 0x000000, 0xB2CAC9, 0x77ACD5, 0x87A0E5, 0x9A97E6, 0xAA92D6, 0xB392B9, 0xB39898, 0xAAA27B, 0x9AAE6A, 0x88B86A, 0x78BC79, 0x6FBC96, 0x6EB6B8, 0x728789, 0x000000, 0x000000 },
+        { 0x2F2F2F, 0x000061, 0x000073, 0x170062, 0x320035, 0x3B0000, 0x320000, 0x190000, 0x000D00, 0x001C00, 0x002000, 0x001900, 0x000833, 0x000000, 0x000000, 0x000000, 0x6C6C6C, 0x001BA2, 0x1400BE, 0x4300AE, 0x670077, 0x760028, 0x6E0000, 0x4F1B00, 0x223700, 0x004C00, 0x005300, 0x004C0E, 0x003762, 0x000000, 0x000000, 0x000000, 0xB8B8B8, 0x2768DB, 0x514CFF, 0x7F35FA, 0xA62ACB, 0xBA2F80, 0xB7412D, 0x9D5B00, 0x737800, 0x448E00, 0x1D9900, 0x099543, 0x0C8397, 0x1D1D1D, 0x000000, 0x000000, 0xB8B8B8, 0x7E9BC3, 0x8E90D4, 0xA086D4, 0xB081C3, 0xB982A7, 0xB98987, 0xB0936A, 0xA09E5A, 0x8EA75A, 0x7EAC6A, 0x75AB86, 0x75A5A7, 0x787878, 0x000000, 0x000000 }
     };
 
-    //PPU Internal Memory. Sized for the four-screen case (4 independent 1KB
-    //nametables) even though the real PPU only has 2KB of on-board VRAM for the
-    //common (non four-screen) mirroring modes - mapNametableAddress() below decides
-    //how many of the 4 physical 1KB slots are actually distinct for the cartridge's
-    //current mirror mode, and cartridges that need all 4 (four-screen mapper 4
-    //boards) just use the other 2KB this array already has spare.
+    //Row-0 (no emphasis) table, kept for debug tools that show a fixed reference
+    //palette instead of the live emphasis-tinted one.
+    public static final int[] NES_PALETTE = EMPHASIS_PALETTE[0];
+
+    //Emphasis-tinted color for a palette index, sampled live from PPUMASK - mid-scanline
+    //$2001 writes change tint starting the very next dot, matching the DAC.
+    private int currentPaletteRgb(int paletteIndex) {
+        int idx = paletteIndex & 0x3F;
+        //Greyscale (PPUMASK bit 0) is DAC-level too: forces low 4 bits to 0, collapsing
+        //to the grey column, and applies to actual rendering (see cpuRead's
+        //"Palette RAM Quirks" comment for the read-side version).
+        if ((ppumask & 0x01) != 0) idx &= 0x30;
+        return EMPHASIS_PALETTE[(ppumask >> 5) & 0x07][idx];
+    }
+
+    //Sized for four-screen (4x1KB nametables) even though real PPU has 2KB VRAM for
+    //common mirroring modes - mapNametableAddress() picks how many slots are distinct;
+    //four-screen boards use the spare 2KB this array already has.
     private final byte[] nametables = new byte[4096];
     private final byte[] paletteRam = new byte[32];
     private final byte[] oam = new byte[256];       //Object Attribute Memory
@@ -56,44 +73,29 @@ public class PPU {
     public int ppuaddr = 0; //$2006
     public int ppudata = 0; //$2007
 
-    //Internal scroll/address latches, modeled the way real hardware actually does it
-    //("loopy" registers) rather than as raw PPUSCROLL bytes. v is the current VRAM
-    //address (also what $2007 reads/writes through) and doubles as the scroll
-    //position; t is the staging register that $2000/$2005/$2006 writes accumulate
-    //into; x is fine X scroll; w is the shared write toggle both $2005 and $2006 use.
-    //Each register is 15 bits: yyy NN YYYYY XXXXX (fine Y, nametable select, coarse Y,
-    //coarse X). Modeling it this way - instead of independent scrollX/scrollY bytes -
-    //is what makes mid-frame scroll-split tricks (SMB's status bar) come out right:
-    //v only picks up t's horizontal bits at cycle 257 of the *previous* scanline and
-    //its vertical bits during the pre-render line, exactly matching when real hardware
-    //latches a new scroll into the active picture, rather than applying every $2005
-    //write immediately.
+    //Internal "loopy" scroll/address latches instead of raw PPUSCROLL bytes. v = current
+    //VRAM address / scroll position; t = staging register for $2000/$2005/$2006; x =
+    //fine X; w = shared write toggle for $2005/$2006. 15 bits: yyy NN YYYYY XXXXX
+    //(fine Y, nametable, coarse Y, coarse X). This is what makes mid-frame scroll
+    //splits (SMB status bar) work: v only picks up t's horizontal bits at cycle 257 of
+    //the previous scanline, and vertical bits during pre-render - not on every $2005 write.
     private boolean addressLatch = false; //w
     private int v = 0x0000;
     private int t = 0x0000;
 
-    //True A12 line state, tracked for CPU-side PPU-bus accesses ($2006 address-set,
-    //$2007 read/write) that move the address bus outside of the per-pixel renderer's
-    //own scanline approximation below. MMC3's IRQ counter is clocked on A12's 0->1
-    //rising edge; blargg's mmc3_irq_tests exercise this directly by toggling $2006 to
-    //move the VRAM address across the $1000 boundary with rendering off, which the
-    //once-per-scanline approximation (see step()'s cycle==260 site) can't reproduce.
+    //True A12 line state for CPU-side PPU-bus accesses ($2006/$2007) outside the
+    //per-pixel renderer's own approximation. MMC3's IRQ counter clocks on A12's 0->1
+    //edge; blargg's mmc3_irq_tests toggle $2006 with rendering off, which the
+    //once-per-scanline approximation (step()'s cycle==260 site) can't reproduce.
     private boolean a12 = false;
 
-    //Separate A12 state for the rendering-fetch approximation (see step()'s
-    //cycle==257/321 sites) so a game/test that leaves rendering enabled while also
-    //directly manipulating the PPU address bus via $2006/$2007 doesn't have the two
-    //mechanisms fight over one shared "current A12 level" - each infers A12 from a
-    //different, unrelated signal (actual bus address vs. which pattern-table half
-    //ppuctrl currently selects), so conflating them produced spurious edges (traced
-    //via mmc3_irq_tests: a manual test loop re-reading a fixed $2007 address kept
-    //getting extra clocks every time the rendering approximation reset the shared
-    //state back to "low" on an unrelated scanline boundary).
+    //Separate A12 state for the rendering-fetch approximation, so it doesn't fight the
+    //bus-access tracker above over one shared level - each infers A12 from a different
+    //signal, and conflating them produced spurious clocks (traced via mmc3_irq_tests).
     private boolean renderA12 = false;
 
-    //Called with the actual PPU address bus value on every access outside of
-    //rendering (see call sites in cpuWrite/cpuRead below). Clocks the mapper IRQ
-    //counter on A12's low-to-high transition, matching real hardware.
+    //Clocks the mapper IRQ counter on A12's low-to-high transition, given the actual
+    //PPU address bus value (see call sites in cpuWrite/cpuRead).
     private void clockA12(int address) {
         boolean newA12 = (address & 0x1000) != 0;
         if (newA12 && !a12 && bus != null) {
@@ -104,60 +106,61 @@ public class PPU {
     private int fineX = 0;
     private byte readBuffer = 0x00;
 
-    //Floating PPU data bus ($2xxx <-> CPU): every register access, read or write,
-    //leaves its value latched here. Reading a write-only register (or the unused low
-    //5 bits of $2002) returns this instead of a fixed 0, matching real hardware.
+    //External octal latch holding the PPU address bus's low 8 bits, plus a flag for
+    //the dot a CPU $2007 access asserts Read. See aleDot()/readDot().
+    private int octalLatch = 0;
+    private boolean ppuDataReadThisDot = false;
+    private boolean ppuDataReadServiced = false;
+    //A $2007 read doesn't fill the buffer on the CPU's issuing dot - the register's
+    //state machine runs first and the Read line asserts several dots later, by which
+    //time the fetch cadence has moved on. With rendering off this is invisible; with
+    //rendering on it's exactly what "ALE + Read" and "$2007 Stress Test" measure.
+    //5 dots = 3 remaining in the issuing CPU cycle + 2 for the state machine.
+    private static final int PPUDATA_READ_DELAY_DOTS = 5;
+    private int ppuDataReadDelay = 0;
+    private int ppuDataReadAddr = 0;
+    private boolean ppuDataIncPending = false;
+
+    //Floating PPU data bus: every register access latches its value here; reading a
+    //write-only register (or $2002's unused low 5 bits) returns this instead of 0.
     private int ppuDataBus = 0x00;
-    //Real hardware's PPU data bus is a capacitor that slowly discharges once nothing
-    //is actively driving it, decaying to 0 within well under 1 second if left alone -
-    //AccuracyCoin's "PPU Register Open Bus" test 5 checks it decays before that.
-    //~5,369,318 PPU dots/second on NTSC (341*262*60.0988); any write to ppuDataBus
-    //resets this back to a comfortably-under-1-second budget.
+    //Real hardware's bus is a capacitor that decays to 0 within well under a second -
+    //AccuracyCoin "PPU Register Open Bus" test 5 checks it decays that fast.
+    //~5,369,318 dots/sec on NTSC; any write resets the decay budget.
     private static final int PPU_BUS_DECAY_TICKS = 4_500_000;
     private int ppuDataBusDecay = PPU_BUS_DECAY_TICKS;
 
-    //Raw PPUSCROLL byte values, kept only for the DEBUG_SPRITE0 trace printouts.
+    //Raw PPUSCROLL bytes, kept only for DEBUG_SPRITE0 trace printouts.
     private int scrollX = 0;
     private int scrollY = 0;
 
     public int cycle = 0;
     public int scanline = 0;
 
-    //Debug-only: whether sprite-0-hit fired at any point during the frame that just
-    //ended, captured right before ppustatus's hit bit is cleared for the new frame
-    //(see step()). Exists because sampling ppustatus's live bit right after VBlank
-    //starts is meaningless - it's already been cleared for the *next* frame by then.
+    //Debug-only: whether sprite-0-hit fired during the frame that just ended, captured
+    //before ppustatus's hit bit is cleared for the new frame - sampling the live bit
+    //right after VBlank starts would already reflect the next frame.
     public boolean lastFrameHadHit = false;
     private boolean hitOccurredThisFrame = false;
 
-    //Set for one PPU tick at the start of VBlank (scanline 241, cycle 1 - the same
-    //moment raiseNMI() fires). The main loop polls this to bound each "frame" of CPU
-    //execution instead of running a fixed CPU-cycle count, so it can never drift out
-    //of phase with the PPU's own continuous scanline/cycle counters - a fixed count
-    //doesn't evenly divide a real NTSC frame (89341/89342 PPU dots), so it used to
-    //slowly desync NMI timing from the CPU's notion of "one frame".
+    //Set for one tick at VBlank start (scanline 241, cycle 1). The main loop polls this
+    //to bound each CPU "frame" instead of a fixed cycle count, since a real NTSC frame
+    //(89341/89342 dots) doesn't divide evenly and a fixed count used to desync NMI timing.
     //
-    //Bounding on VBlank-start rather than the scanline-262 wrap also matches how NES
-    //games structure their own main loop (they treat NMI as "start of frame" and
-    //spend most of the frame - the visible scanlines - between one NMI and the next,
-    //hitting their "wait for VBlank" poll only right before the next NMI). Slicing the
-    //trace log the same way means a frame's trace starts right after NMI, instead of
-    //starting mid-VBlank and showing the wait-loop exit near the very end of the slice.
-    //The real NMI line is level-sensitive AND(VBlank flag, PPUCTRL bit 7) - the CPU's
-    //own NMI input is edge-sensitive on that line's 0->1 transition. Tracking only
-    //"did VBlank just start AND was NMI already enabled at that instant" (as this
-    //code used to) misses every other way that same transition can happen: enabling
-    //NMI via a $2000 write while the VBlank flag is already set (AccuracyCoin's "NMI
-    //Control" test 3), or disabling and re-enabling within the same VBlank (test 7).
-    //nmiLine mirrors the AND's last known value; updateNmiLine() re-evaluates it
-    //(and fires cpu.raiseNMI() on a 0->1 edge) from every place that can change either
-    //of its two inputs: VBlank set/clear (below) and PPUCTRL writes (cpuWrite).
+    //Bounding on VBlank-start also matches how games structure their own loop (NMI =
+    //"start of frame"), so trace logs slice the same way real gameplay does.
+    //
+    //The real NMI line is level-sensitive AND(VBlank flag, PPUCTRL bit7); the CPU's NMI
+    //input is edge-sensitive on that line's 0->1 transition. Tracking only "did VBlank
+    //just start AND was NMI already enabled" misses other ways the transition can
+    //happen: enabling NMI via $2000 while VBlank is already set (AccuracyCoin "NMI
+    //Control" test 3), or disabling/re-enabling within the same VBlank (test 7).
+    //nmiLine mirrors the AND's last value; updateNmiLine() re-evaluates it (firing
+    //cpu.raiseNMI() on a 0->1 edge) from every place that can change either input.
     private boolean nmiLine = false;
-    //Mirrors ppustatus's VBlank bit for NMI-line purposes only, but clears 1 PPU dot
-    //earlier than the CPU-visible $2002 bit (see the scanline==261,cycle==0 site below) -
-    //empirically matches AccuracyCoin's "NMI at VBlank End" expected results, which
-    //transition 1 dot earlier than "VBlank End"'s own $2002-read-based table despite
-    //both being calibrated to the same ~2273-cycle target.
+    //Mirrors ppustatus's VBlank bit for NMI purposes, but clears 1 dot earlier than the
+    //CPU-visible $2002 bit - matches AccuracyCoin "NMI at VBlank End" timing, which is
+    //1 dot earlier than "VBlank End"'s own $2002-based table despite the same target.
     private boolean nmiVblLevel = false;
     private void updateNmiLine() {
         boolean newLine = nmiVblLevel && ((ppuctrl & 0x80) != 0);
@@ -165,14 +168,9 @@ public class PPU {
         nmiLine = newLine;
     }
 
-    //Set when $2002 is read on the exact PPU cycle immediately preceding the one
-    //that would set the VBlank flag (scanline 241, cycle 0 - the CPU's own read
-    //always happens before this iteration's PPU ticks run, so "read here" means
-    //the read landed 1 PPU cycle ahead of the flag-set tick). Per AccuracyCoin's
-    //"VBlank Beginning" test (case A=4) and "NMI Suppression" test, a read that
-    //precisely straddles the flag-set tick this way suppresses the flag from being
-    //set at all for the rest of this VBlank - and since the NMI line is derived from
-    //the flag, that also means no NMI fires this frame.
+    //Set when $2002 is read exactly 1 PPU cycle before the VBlank-set tick (scanline
+    //241, cycle 0). Per AccuracyCoin "VBlank Beginning" (case A=4) and "NMI
+    //Suppression", such a read suppresses VBlank (and thus NMI) for the rest of this frame.
     private boolean suppressVblSet = false;
 
     private boolean vblankStarted = false;
@@ -199,11 +197,9 @@ public class PPU {
         nmiLine = false;
     }
 
-    //Full power-on reset: everything reset() clears, plus VRAM/OAM/palette RAM and
-    //the read buffer/data bus - a real NES reset button leaves those alone, but the
-    //TAS Maker's "replay from power-on" seeking needs every repeated replay of the
-    //same input log to land on the exact same state, which requires starting from a
-    //truly blank PPU rather than whatever VRAM a previous replay happened to leave behind.
+    //Full power-on reset: also clears VRAM/OAM/palette RAM and the read buffer/data
+    //bus (unlike a real reset button) - needed so the TAS Maker's "replay from
+    //power-on" always lands on the same state across repeated replays.
     public void hardReset() {
         reset();
         java.util.Arrays.fill(nametables, (byte) 0);
@@ -217,12 +213,9 @@ public class PPU {
         hitOccurredThisFrame = false;
     }
 
-    //TAS Maker greenzone checkpoint support - see CPU.State's comment for why this is
-    //only ever captured/restored at a CPU instruction boundary. The row* fields are
-    //transient per-scanline rendering scratch (recomputed at the start of each
-    //scanline before use), so they're technically redundant to snapshot, but they're
-    //cheap (8-element arrays) and capturing them anyway avoids relying on that being
-    //true forever as rendering code changes.
+    //TAS Maker greenzone checkpoint - see CPU.State for why it's only captured/restored
+    //at instruction boundaries. row* fields are transient per-scanline scratch
+    //(cheap arrays); snapshotting them anyway avoids relying on that staying true.
     public static final class State {
         byte[] nametables, paletteRam, oam;
         int ppuctrl, ppumask, ppustatus, oamaddr, oamdata, ppuscroll, ppuaddr, ppudata;
@@ -234,20 +227,17 @@ public class PPU {
         int scrollX, scrollY;
         int cycle, scanline;
         boolean lastFrameHadHit, hitOccurredThisFrame;
-        boolean nmiLine, nmiVblLevel, suppressVblSet, vblankStarted, pendingVblNmiEdge;
-        int[] rowSpriteX, rowSpritePlane0, rowSpritePlane1, rowSpritePaletteGroup;
-        boolean[] rowSpriteFlipH, rowSpriteBehind, rowSpriteIsZero;
-        int rowSpriteCount;
+        boolean nmiLine, nmiVblLevel, suppressVblSet, vblankStarted, pendingVblNmiEdge, oddFrame;
+        int[] sprShiftLo, sprShiftHi, sprAttrLatch, sprCounter, sprPixelOut;
+        boolean[] sprHalted, sprIsZero;
         boolean rowShowBackground, rowShowSprites, rowShowLeftBackground, rowShowLeftSprites;
-        int rowBackdropRgb;
+        int rowBackdropPaletteIdx;
         int bgNextTileId, bgNextAttr, bgNextLsb, bgNextMsb;
         int bgShiftPatternLo, bgShiftPatternHi, bgShiftAttrLo, bgShiftAttrHi;
         byte[] secondaryOam;
-        int evalAddr, evalCopyRemaining, evalSecCount, evalSpritesScanned, evalLastReadValue, evalTargetScanline;
+        int evalAddr, evalCopyRemaining, evalSecCount, evalSpritesScanned, evalLastReadValue, evalTargetScanline, evalStepsExecuted;
         boolean evalActive;
-        boolean[] nextSpriteIsZero, nextSpriteFlipH, nextSpriteBehind;
-        int[] nextSpriteX, nextSpritePlane0, nextSpritePlane1, nextSpritePaletteGroup;
-        int nextSpriteCount;
+        int octalLatch, ppuDataReadDelay, ppuDataReadAddr, pendingMaskValue, pendingMaskDelay, pendingVValue, pendingVDelay;
     }
 
     public State snapshot() {
@@ -266,19 +256,18 @@ public class PPU {
         s.scrollX = scrollX; s.scrollY = scrollY;
         s.cycle = cycle; s.scanline = scanline;
         s.lastFrameHadHit = lastFrameHadHit; s.hitOccurredThisFrame = hitOccurredThisFrame;
-        s.nmiLine = nmiLine; s.nmiVblLevel = nmiVblLevel; s.suppressVblSet = suppressVblSet;
+        s.nmiLine = nmiLine; s.nmiVblLevel = nmiVblLevel; s.suppressVblSet = suppressVblSet; s.oddFrame = oddFrame;
         s.vblankStarted = vblankStarted; s.pendingVblNmiEdge = pendingVblNmiEdge;
-        s.rowSpriteX = rowSpriteX.clone();
-        s.rowSpritePlane0 = rowSpritePlane0.clone();
-        s.rowSpritePlane1 = rowSpritePlane1.clone();
-        s.rowSpritePaletteGroup = rowSpritePaletteGroup.clone();
-        s.rowSpriteFlipH = rowSpriteFlipH.clone();
-        s.rowSpriteBehind = rowSpriteBehind.clone();
-        s.rowSpriteIsZero = rowSpriteIsZero.clone();
-        s.rowSpriteCount = rowSpriteCount;
+        s.sprShiftLo = sprShiftLo.clone();
+        s.sprShiftHi = sprShiftHi.clone();
+        s.sprAttrLatch = sprAttrLatch.clone();
+        s.sprCounter = sprCounter.clone();
+        s.sprPixelOut = sprPixelOut.clone();
+        s.sprHalted = sprHalted.clone();
+        s.sprIsZero = sprIsZero.clone();
         s.rowShowBackground = rowShowBackground; s.rowShowSprites = rowShowSprites;
         s.rowShowLeftBackground = rowShowLeftBackground; s.rowShowLeftSprites = rowShowLeftSprites;
-        s.rowBackdropRgb = rowBackdropRgb;
+        s.rowBackdropPaletteIdx = rowBackdropPaletteIdx;
         s.bgNextTileId = bgNextTileId; s.bgNextAttr = bgNextAttr;
         s.bgNextLsb = bgNextLsb; s.bgNextMsb = bgNextMsb;
         s.bgShiftPatternLo = bgShiftPatternLo; s.bgShiftPatternHi = bgShiftPatternHi;
@@ -287,14 +276,10 @@ public class PPU {
         s.evalAddr = evalAddr; s.evalCopyRemaining = evalCopyRemaining; s.evalSecCount = evalSecCount;
         s.evalSpritesScanned = evalSpritesScanned; s.evalLastReadValue = evalLastReadValue;
         s.evalTargetScanline = evalTargetScanline; s.evalActive = evalActive;
-        s.nextSpriteIsZero = nextSpriteIsZero.clone();
-        s.nextSpriteX = nextSpriteX.clone();
-        s.nextSpritePlane0 = nextSpritePlane0.clone();
-        s.nextSpritePlane1 = nextSpritePlane1.clone();
-        s.nextSpriteFlipH = nextSpriteFlipH.clone();
-        s.nextSpriteBehind = nextSpriteBehind.clone();
-        s.nextSpritePaletteGroup = nextSpritePaletteGroup.clone();
-        s.nextSpriteCount = nextSpriteCount;
+        s.evalStepsExecuted = evalStepsExecuted;
+        s.octalLatch = octalLatch; s.ppuDataReadDelay = ppuDataReadDelay; s.ppuDataReadAddr = ppuDataReadAddr;
+        s.pendingMaskValue = pendingMaskValue; s.pendingMaskDelay = pendingMaskDelay;
+        s.pendingVValue = pendingVValue; s.pendingVDelay = pendingVDelay;
         return s;
     }
 
@@ -313,19 +298,18 @@ public class PPU {
         scrollX = s.scrollX; scrollY = s.scrollY;
         cycle = s.cycle; scanline = s.scanline;
         lastFrameHadHit = s.lastFrameHadHit; hitOccurredThisFrame = s.hitOccurredThisFrame;
-        nmiLine = s.nmiLine; nmiVblLevel = s.nmiVblLevel; suppressVblSet = s.suppressVblSet;
+        nmiLine = s.nmiLine; nmiVblLevel = s.nmiVblLevel; suppressVblSet = s.suppressVblSet; oddFrame = s.oddFrame;
         vblankStarted = s.vblankStarted; pendingVblNmiEdge = s.pendingVblNmiEdge;
-        System.arraycopy(s.rowSpriteX, 0, rowSpriteX, 0, rowSpriteX.length);
-        System.arraycopy(s.rowSpritePlane0, 0, rowSpritePlane0, 0, rowSpritePlane0.length);
-        System.arraycopy(s.rowSpritePlane1, 0, rowSpritePlane1, 0, rowSpritePlane1.length);
-        System.arraycopy(s.rowSpritePaletteGroup, 0, rowSpritePaletteGroup, 0, rowSpritePaletteGroup.length);
-        System.arraycopy(s.rowSpriteFlipH, 0, rowSpriteFlipH, 0, rowSpriteFlipH.length);
-        System.arraycopy(s.rowSpriteBehind, 0, rowSpriteBehind, 0, rowSpriteBehind.length);
-        System.arraycopy(s.rowSpriteIsZero, 0, rowSpriteIsZero, 0, rowSpriteIsZero.length);
-        rowSpriteCount = s.rowSpriteCount;
+        System.arraycopy(s.sprShiftLo, 0, sprShiftLo, 0, sprShiftLo.length);
+        System.arraycopy(s.sprShiftHi, 0, sprShiftHi, 0, sprShiftHi.length);
+        System.arraycopy(s.sprAttrLatch, 0, sprAttrLatch, 0, sprAttrLatch.length);
+        System.arraycopy(s.sprCounter, 0, sprCounter, 0, sprCounter.length);
+        System.arraycopy(s.sprPixelOut, 0, sprPixelOut, 0, sprPixelOut.length);
+        System.arraycopy(s.sprHalted, 0, sprHalted, 0, sprHalted.length);
+        System.arraycopy(s.sprIsZero, 0, sprIsZero, 0, sprIsZero.length);
         rowShowBackground = s.rowShowBackground; rowShowSprites = s.rowShowSprites;
         rowShowLeftBackground = s.rowShowLeftBackground; rowShowLeftSprites = s.rowShowLeftSprites;
-        rowBackdropRgb = s.rowBackdropRgb;
+        rowBackdropPaletteIdx = s.rowBackdropPaletteIdx;
         bgNextTileId = s.bgNextTileId; bgNextAttr = s.bgNextAttr;
         bgNextLsb = s.bgNextLsb; bgNextMsb = s.bgNextMsb;
         bgShiftPatternLo = s.bgShiftPatternLo; bgShiftPatternHi = s.bgShiftPatternHi;
@@ -334,27 +318,18 @@ public class PPU {
         evalAddr = s.evalAddr; evalCopyRemaining = s.evalCopyRemaining; evalSecCount = s.evalSecCount;
         evalSpritesScanned = s.evalSpritesScanned; evalLastReadValue = s.evalLastReadValue;
         evalTargetScanline = s.evalTargetScanline; evalActive = s.evalActive;
-        System.arraycopy(s.nextSpriteIsZero, 0, nextSpriteIsZero, 0, nextSpriteIsZero.length);
-        System.arraycopy(s.nextSpriteX, 0, nextSpriteX, 0, nextSpriteX.length);
-        System.arraycopy(s.nextSpritePlane0, 0, nextSpritePlane0, 0, nextSpritePlane0.length);
-        System.arraycopy(s.nextSpritePlane1, 0, nextSpritePlane1, 0, nextSpritePlane1.length);
-        System.arraycopy(s.nextSpriteFlipH, 0, nextSpriteFlipH, 0, nextSpriteFlipH.length);
-        System.arraycopy(s.nextSpriteBehind, 0, nextSpriteBehind, 0, nextSpriteBehind.length);
-        System.arraycopy(s.nextSpritePaletteGroup, 0, nextSpritePaletteGroup, 0, nextSpritePaletteGroup.length);
-        nextSpriteCount = s.nextSpriteCount;
+        evalStepsExecuted = s.evalStepsExecuted;
+        octalLatch = s.octalLatch; ppuDataReadDelay = s.ppuDataReadDelay; ppuDataReadAddr = s.ppuDataReadAddr;
+        pendingMaskValue = s.pendingMaskValue; pendingMaskDelay = s.pendingMaskDelay;
+        pendingVValue = s.pendingVValue; pendingVDelay = s.pendingVDelay;
     }
 
-    //World-space (512x480, matching NESDisplayPanel's tiled-nametable buffer) scroll
-    //position derived from the current v register + fine X: bit 10 of v is the
-    //horizontal nametable-select bit (which of the 2 world halves scrolling starts
-    //from), coarse X (bits 0-4) counts 8px tile steps within that half, fine X is the
-    //sub-tile pixel offset.
-    //Standard "loopy" Y-increment, run once per rendering-enabled scanline at dot 256
-    //(see step()'s call site). Fine Y counts 0-7 within a tile row; when it wraps,
-    //coarse Y advances, and coarse Y wrapping past the last real nametable row (29)
-    //flips which physical nametable half v's Y side points at (bit 11) instead of
-    //just wrapping numerically - coarse Y values 30-31 are the "attribute table"
-    //rows some games briefly scroll into, which wrap without flipping the half.
+    //World-space (512x480) scroll X from v + fineX: bit 10 = which world half, coarse
+    //X = 8px tile steps, fineX = sub-tile offset.
+    //Standard loopy Y-increment, run once per rendering scanline at dot 256. Fine Y
+    //counts 0-7; on wrap coarse Y advances; coarse Y wrapping past 29 flips the
+    //vertical nametable half (bit 11) - values 30-31 are attribute-table rows that
+    //wrap without flipping.
     private void incrementY() {
         if ((v & 0x7000) != 0x7000) {
             v += 0x1000; //fine Y += 1
@@ -373,10 +348,8 @@ public class PPU {
         }
     }
 
-    //Coarse-X companion to incrementY() - run once every 8 dots (cycle%8==0) during
-    //the background fetch cadence, matching real hardware's per-tile horizontal step.
-    //Coarse X (bits 0-4) wrapping past 31 flips which physical nametable half v's X
-    //side points at (bit 10), same idea as incrementY()'s bit-11 flip.
+    //Coarse-X companion to incrementY() - runs every 8 dots during the fetch cadence.
+    //Wrapping past 31 flips the horizontal nametable half (bit 10).
     private void incrementScrollX() {
         if ((v & 0x001F) == 31) {
             v &= ~0x001F;
@@ -386,12 +359,10 @@ public class PPU {
         }
     }
 
-    //Shifts all 4 background shift registers left by 1, called once per rendering
-    //dot (see bgFetchAndShiftStep). Real hardware's BG pattern shift registers have
-    //their serial input tied high, not low - AccuracyCoin's "BG Serial In" test 2
-    //checks exactly this: shifting should bring a 1 into bit 0, not a 0 - which only
-    //becomes observable when rendering continues without fresh tile data behind it
-    //(e.g. carefully timed $2001 writes that skip a reload).
+    //Shifts all 4 background shift registers left by 1, once per rendering dot.
+    //Serial input is tied high (not low) on real hardware - AccuracyCoin "BG Serial
+    //In" test 2 checks a shift brings in a 1, observable when rendering continues
+    //without a fresh tile behind it.
     private void updateBgShifters() {
         bgShiftPatternLo = (bgShiftPatternLo << 1) | 1;
         bgShiftPatternHi = (bgShiftPatternHi << 1) | 1;
@@ -399,11 +370,9 @@ public class PPU {
         bgShiftAttrHi = (bgShiftAttrHi << 1) & 0xFFFF;
     }
 
-    //Loads the just-fetched tile (bgNext*) into the low byte of each shift register -
-    //called every 8 dots, right as a new tile's high pattern byte fetch completes
-    //(see bgFetchAndShiftStep's case 0). The attribute shifters get a full byte of
-    //all-0s or all-1s per bit (rather than the raw 2-bit group) so the same per-dot
-    //bitMux extraction used for the pattern shifters also works for palette selection.
+    //Loads the just-fetched tile into the shift registers' low byte, every 8 dots.
+    //Attribute shifters get a full all-0/all-1 byte per bit so the same per-dot mux
+    //used for pattern data also works for palette selection.
     private void loadBgShifters() {
         bgShiftPatternLo = (bgShiftPatternLo & 0xFF00) | bgNextLsb;
         bgShiftPatternHi = (bgShiftPatternHi & 0xFF00) | bgNextMsb;
@@ -411,55 +380,190 @@ public class PPU {
         bgShiftAttrHi = (bgShiftAttrHi & 0xFF00) | (((bgNextAttr & 0x02) != 0) ? 0xFF : 0x00);
     }
 
-    //Drives the real per-dot background fetch/shift pipeline - called from step()
-    //for every dot of a rendering-enabled visible/pre-render scanline, BEFORE that
-    //dot's pixel is composited (renderPixel reads the shifters after this runs, so
-    //it sees this dot's own shift, not the previous dot's - matching real hardware's
-    //"shift, then sample" order within a single dot).
+    //Drives the real per-dot background fetch/shift pipeline, called from step() for
+    //every dot of a rendering visible/pre-render scanline, before this dot's pixel is
+    //composited (shift happens before sample, like real hardware).
     //
-    //Fetches happen in the standard 8-dot cadence during dots 1-256 (this scanline's
-    //32 visible tiles) and 321-336 (prefetching the first 2 tiles of the NEXT
-    //scanline, already latched into v by the dot-257 horizontal copy / dot-280-304
-    //vertical copy): nametable byte (dots 1-2 of the group), attribute byte (3-4),
-    //pattern low byte (5-6), pattern high byte (7-8), with the shifters reloaded and
-    //coarse X incremented right after the high byte fetch (dot 8 of the group). Dots
-    //337 and 339 perform the two harmless "dummy" nametable fetches real hardware
-    //does at the end of every scanline (their result is never used - the very next
-    //real fetch, at dot 1 of the next scanline, overwrites bgNextTileId again).
+    //8-dot cadence over dots 1-256 (this scanline's 32 tiles) and 321-336 (prefetch of
+    //next scanline's first 2 tiles): nametable byte (1-2), attribute byte (3-4),
+    //pattern low (5-6), pattern high (7-8), shifters reloaded + coarse X incremented
+    //at dot 8. Dots 337/339 do the two harmless dummy nametable fetches real hardware
+    //performs at scanline end (result unused).
+    //Each fetch is two dots: on the ALE dot the PPU drives the full address and an
+    //external octal latch captures the low 8 bits (address/data share pins); on the
+    //read dot only the upper 6 bits are re-driven and the byte comes back through that latch.
+    //
+    //Modelling this as one atomic "compute address, read it" hides what AccuracyCoin's
+    //"Hybrid Addresses" and "ALE + Read" tests probe: a $2006 write landing between the
+    //two dots splices a new high byte onto a stale latched low byte.
+    private int fetchAleAddr(int phase) {
+        switch (phase) {
+            case 0: return 0x2000 | (v & 0x0FFF);
+            case 1: return 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+            default: {
+                int bgTableOffset = ((ppuctrl & 0x10) != 0) ? 0x1000 : 0x0000;
+                int fineY = (v >> 12) & 0x07;
+                return bgTableOffset + (bgNextTileId * 16) + fineY + (phase == 3 ? 8 : 0);
+            }
+        }
+    }
+
+    //One dot of the address bus: latches low byte on an ALE dot, or reads through the
+    //latch on a read dot. bgFetchPhase says which of the four fetches this pair belongs to.
+    //If a $2007 access asserts Read on this same dot, ALE and Read fight and the latch
+    //keeps its old low byte instead of accepting the new one. The $2007 read is then
+    //serviced through that stale byte, and the fetch's own read dot one dot later
+    //addresses through it too - this is "ALE + Read": the low bit plane comes from an
+    //address the fetch never asked for.
+    private void aleDot(int phase) {
+        if (ppuDataReadThisDot) {
+            readBuffer = ppuRead((fetchAleAddr(phase) & 0x3F00) | octalLatch);
+            ppuDataReadServiced = true;
+            return;
+        }
+        octalLatch = fetchAleAddr(phase) & 0xFF;
+    }
+
+    private int readDot(int phase) {
+        int addr = (fetchAleAddr(phase) & 0x3F00) | octalLatch;
+        int data = ppuRead(addr) & 0xFF;
+        //The read drives the shared pins, so the latch tracks the data byte until the
+        //next ALE overwrites it - invisible in a normal cadence, decisive when ALE is suppressed.
+        octalLatch = data;
+        //If a $2007 state-machine read lands here without a simultaneous ALE, it just
+        //rides along on whatever this fetch dot read - AccuracyCoin's "$2007 Stress
+        //Test" documents this as the "stable read buffer" case.
+        if (ppuDataReadThisDot) {
+            readBuffer = (byte) data;
+            ppuDataReadServiced = true;
+        }
+        return data;
+    }
+
+    //Sprite-fetch counterpart to aleDot/readDot - drives the same octal latch/ALE/Read
+    //lines during dots 257-320, but the address doesn't come from bgNextTileId/v: the
+    //first two dots of each slot are nametable reads through the current v (garbage -
+    //real sprite tile ID comes from secondary OAM, but the bus is still driven and
+    //observable to a $2007 read, per AccuracyCoin's "AT* reads are NT reads" note),
+    //and the last two are the sprite pattern table's low/high address for that slot.
+    //Takes a raw address since it's not one of fetchAleAddr's four cases.
+    private void spriteAleDot(int addr) {
+        if (ppuDataReadThisDot) {
+            readBuffer = ppuRead((addr & 0x3F00) | octalLatch);
+            ppuDataReadServiced = true;
+            return;
+        }
+        octalLatch = addr & 0xFF;
+    }
+
+    private void spriteReadDot(int addr) {
+        int a = (addr & 0x3F00) | octalLatch;
+        int data = ppuRead(a) & 0xFF;
+        octalLatch = data;
+        //See readDot's comment - same shared pins, so a $2007 read landing here
+        //without ALE rides along the same way.
+        if (ppuDataReadThisDot) {
+            readBuffer = (byte) data;
+            ppuDataReadServiced = true;
+        }
+    }
+
+    //Address bus value for a sprite slot's pattern-table dots (phases 4-7) - same math
+    //fetchSpriteSlot uses to load the shift registers, computed independently since
+    //this runs mid-slot (dots 261-264) while fetchSpriteSlot runs once at slot end.
+    //An unused/out-of-range ($FF) slot still drives a real address on real hardware; row
+    //is clamped rather than special-cased so this always returns a valid address.
+    private int spritePatternFetchAddr(int slot, boolean highPlane) {
+        int base = slot * 4;
+        int y = secondaryOam[base] & 0xFF;
+        int tileIndex = secondaryOam[base + 1] & 0xFF;
+        int attr = secondaryOam[base + 2] & 0xFF;
+        boolean tall = (ppuctrl & 0x20) != 0;
+        int spriteHeight = tall ? 16 : 8;
+        int spritePatternBase = ((ppuctrl & 0x08) != 0) ? 0x1000 : 0x0000;
+        boolean flipV = (attr & 0x80) != 0;
+        int patternTableOffset = tall ? (((tileIndex & 0x01) != 0) ? 0x1000 : 0x0000) : spritePatternBase;
+        int tileNumber = tall ? (tileIndex & 0xFE) : tileIndex;
+        int row = (scanline & 0xFF) - y;
+        if (row < 0 || row >= spriteHeight) row = flipV ? 0 : spriteHeight - 1;
+        int rowInTile = flipV ? (spriteHeight - 1 - row) : row;
+        int tileOffset;
+        if (tall) {
+            int half = rowInTile / 8;
+            int rowWithinHalf = rowInTile % 8;
+            tileOffset = patternTableOffset + ((tileNumber + half) * 16) + rowWithinHalf;
+        } else {
+            tileOffset = patternTableOffset + (tileNumber * 16) + rowInTile;
+        }
+        return tileOffset + (highPlane ? 8 : 0);
+    }
+
+    //Drives the ALE/Read latch cadence for the sprite-fetch window (dots 257-320),
+    //alongside bgFetchAndShiftStep - both compete for the same latch/Read hijack a
+    //mistimed $2007 access can trigger (see spriteAleDot's comment).
+    private void spriteFetchAleStep(int cycle) {
+        if (cycle < 257 || cycle > 320) return;
+        int slot = (cycle - 257) / 8;
+        switch ((cycle - 257) % 8) {
+            case 0: spriteAleDot(fetchAleAddr(0)); break;
+            case 1: spriteReadDot(fetchAleAddr(0)); break;
+            case 2: spriteAleDot(fetchAleAddr(0)); break;
+            case 3: spriteReadDot(fetchAleAddr(0)); break;
+            case 4: spriteAleDot(spritePatternFetchAddr(slot, false)); break;
+            case 5: spriteReadDot(spritePatternFetchAddr(slot, false)); break;
+            case 6: spriteAleDot(spritePatternFetchAddr(slot, true)); break;
+            case 7: spriteReadDot(spritePatternFetchAddr(slot, true)); break;
+        }
+    }
+
+    //Shifting, reloading and fetching each run on their own window rather than one
+    //shared window - real hardware: fetches occupy 1-256/321-336 (first ALE at dot 1),
+    //shifters run one dot behind (2-257/322-337), reload lands right after each group
+    //completes (9,17,...257, plus 329/337). A single "dots 2-257" window used to cost
+    //the fetch group its dot-1 ALE, leaving the scanline's first read using a stale latch.
     private void bgFetchAndShiftStep(int cycle) {
-        if ((cycle >= 2 && cycle <= 257) || (cycle >= 321 && cycle <= 337)) {
-            updateBgShifters();
+        if ((cycle >= 2 && cycle <= 257) || (cycle >= 322 && cycle <= 337)) updateBgShifters();
+        if (((cycle - 1) % 8) == 0 && ((cycle >= 9 && cycle <= 257) || cycle == 329 || cycle == 337)) {
+            loadBgShifters();
+        }
+        if ((cycle >= 1 && cycle <= 256) || (cycle >= 321 && cycle <= 336)) {
             switch ((cycle - 1) % 8) {
                 case 0:
-                    loadBgShifters();
-                    bgNextTileId = ppuRead(0x2000 | (v & 0x0FFF)) & 0xFF;
+                    aleDot(0);
                     break;
-                case 2: {
-                    int attrAddr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
-                    int attr = ppuRead(attrAddr) & 0xFF;
-                    if ((v & 0x0040) != 0) attr >>= 4; //coarse Y bit 1 selects the bottom half of the attribute byte
-                    if ((v & 0x0002) != 0) attr >>= 2; //coarse X bit 1 selects the right half
+                case 1:
+                    bgNextTileId = readDot(0);
+                    break;
+                case 2:
+                    aleDot(1);
+                    break;
+                case 3: {
+                    int attr = readDot(1);
+                    if ((v & 0x0040) != 0) attr >>= 4; //coarse Y bit 1 selects bottom half of attribute byte
+                    if ((v & 0x0002) != 0) attr >>= 2; //coarse X bit 1 selects right half
                     bgNextAttr = attr & 0x03;
                     break;
                 }
-                case 4: {
-                    int bgTableOffset = ((ppuctrl & 0x10) != 0) ? 0x1000 : 0x0000;
-                    int fineY = (v >> 12) & 0x07;
-                    bgNextLsb = ppuRead(bgTableOffset + (bgNextTileId * 16) + fineY) & 0xFF;
+                case 4:
+                    aleDot(2);
                     break;
-                }
-                case 6: {
-                    int bgTableOffset = ((ppuctrl & 0x10) != 0) ? 0x1000 : 0x0000;
-                    int fineY = (v >> 12) & 0x07;
-                    bgNextMsb = ppuRead(bgTableOffset + (bgNextTileId * 16) + fineY + 8) & 0xFF;
+                case 5:
+                    bgNextLsb = readDot(2);
                     break;
-                }
+                case 6:
+                    aleDot(3);
+                    break;
                 case 7:
+                    bgNextMsb = readDot(3);
                     incrementScrollX();
                     break;
             }
-        } else if (cycle == 339) {
-            bgNextTileId = ppuRead(0x2000 | (v & 0x0FFF)) & 0xFF;
+        } else if (cycle == 337 || cycle == 339) {
+            //Harmless dummy nametable fetches at scanline end. Result discarded, but
+            //they still drive ALE/address bus and mark the octal latch.
+            aleDot(0);
+        } else if (cycle == 338 || cycle == 340) {
+            bgNextTileId = readDot(0);
         }
     }
 
@@ -468,8 +572,7 @@ public class PPU {
         return (base + ((v & 0x001F) * 8) + fineX) & 0x1FF; //mod 512 (world width)
     }
 
-    //Same idea vertically: bit 11 of v selects the world half, coarse Y (bits 5-9)
-    //counts 8px tile steps, fine Y (bits 12-14) is the sub-tile pixel offset.
+    //Same idea vertically: bit 11 selects world half, coarse Y = tile steps, fine Y = sub-tile offset.
     public int getWorldScrollY() {
         int base = ((v & 0x0800) != 0) ? 240 : 0;
         int coarseY = (v >> 5) & 0x1F;
@@ -477,13 +580,11 @@ public class PPU {
         return (base + coarseY * 8 + fineY) % 480; //mod 480 (world height)
     }
 
-    //The $2007 auto-increment after a CPU read/write of PPUDATA. With rendering
-    //disabled this is the familiar "+1 or +32 depending on PPUCTRL bit 2". But when
-    //rendering is *enabled* on a visible/pre-render scanline, $2007 doesn't own the
-    //address bus - the rendering pipeline does - and the increment instead runs the
-    //renderer's own two increment circuits simultaneously: the coarse-X step and the
-    //Y step. AccuracyCoin's "$2007 Read W/ Rendering" test 2 checks exactly that the
-    //vertical increment happens here.
+    //$2007 auto-increment after a CPU read/write. With rendering off it's the usual
+    //+1/+32 (PPUCTRL bit 2). With rendering on during a visible/pre-render scanline,
+    //$2007 doesn't own the address bus - the renderer does - so this instead runs the
+    //renderer's own coarse-X and Y increments. AccuracyCoin "$2007 Read W/ Rendering"
+    //test 2 checks the vertical increment happens here.
     private void incrementVramAddressAfterCpuAccess() {
         boolean renderingEnabled = (ppumask & 0x18) != 0;
         boolean visibleOrPrerender = scanline <= 239 || scanline == 261;
@@ -493,31 +594,22 @@ public class PPU {
         } else {
             v += ((ppuctrl & 0x04) != 0) ? 32 : 1;
         }
-        //v is a 15-bit register, so it wraps at $8000 - NOT at $4000. Masking to
-        //$3FFF here would silently clear fine-Y's high bit (bit 14) every time the
-        //vertical increment carried into it, which is exactly the bit the
-        //"$2007 Read W/ Rendering" test observes (it expects v += $1001).
+        //v wraps at $8000 (15-bit), not $4000 - masking to $3FFF would clear fine-Y's
+        //high bit on vertical carry, which "$2007 Read W/ Rendering" expects (v += $1001).
         v &= 0x7FFF;
     }
 
     public byte cpuRead(int address) {
         switch (address) {
             case 0x2002: //PPUSTATUS - only bits 5-7 are real; the rest are open bus
-                //A $2002 read latches the VBlank flag at the START of the read (when M2
-                //goes high), but bits 5 and 6 are NOT latched - the CPU samples them at
-                //the END of the read, when M2 goes low, roughly 1.875 PPU dots later.
-                //So a read that straddles the pre-render clear point sees VBlank still
-                //set while the sprite flags have already gone. See AccuracyCoin
-                //"$2002 Flag Timing" test 1, whose whole point is this skew.
+                //Bit 7 and bits 6/5 sample at different points in this CPU cycle (see
+                //the M2 phase model at top of file). Bit 7 latches when M2 rises; bits
+                //6/5 read off the flip-flops when M2 falls, ~2 dots later - so a read
+                //straddling the pre-render clear can see VBlank still set while sprite
+                //flags are already gone. AccuracyCoin "$2002 Flag Timing" test 1 answer
+                //key ($E0/$80/$80/$00) only comes out right with this skew.
                 int statusBits = ppustatus & 0xE0;
-                //NOTE: this models only the sprite-flag half of the skew. Fully passing
-                //"$2002 Flag Timing" test 1 would additionally require a read reported
-                //at scanline 261 dot 0 to see VBlank already cleared - but "VBlank End"
-                //requires that same read to see it still set. The two are
-                //distinguishable only by sub-dot M2 phase, which this emulator's
-                //"run a whole CPU instruction, then 3 PPU dots" interleaving does not
-                //resolve, so test 1 is left failing rather than regressing VBlank End.
-                if (dotsUntilPreRenderFlagClear() <= 2) statusBits &= ~0x60;
+                if (dotsUntilPreRenderFlagClear() <= M2_FALL_LOOKAHEAD_DOTS) statusBits &= ~0x60;
                 byte status = (byte) (statusBits | (ppuDataBus & 0x1F));
                 if (DEBUG_SPRITE0) System.out.printf("  [read $2002 -> %02x] scanline=%d cycle=%d%n", status & 0xFF, scanline, cycle);
                 ppustatus &= ~0x80; //Clear VBlank bit on read
@@ -526,59 +618,53 @@ public class PPU {
                 if (scanline == 241 && cycle == 1 && cpu != null) cpu.cancelPendingNMI(); //read races the flag-set tick: flag stands, but NMI is suppressed
                 updateNmiLine(); //a read-cleared VBlank flag can also drop the NMI line
                 addressLatch = false; //Reset address latch
-                //Only bits 5-7 of the bus are actually driven by this read (see this
-                //case's own comment) - the decay clock isn't reset here, since the
-                //lower 5 bits (whatever they currently are) keep aging normally.
+                //Only bits 5-7 are driven by this read, so the decay clock isn't reset -
+                //the lower 5 bits keep aging normally.
                 ppuDataBus = status & 0xFF;
                 return status;
 
             case 0x2004: { //OAMDATA
-                int oamVal;
-                boolean renderingEnabled = (ppumask & 0x18) != 0;
-                boolean visibleOrPrerender = scanline <= 239 || scanline == 261;
-                if (renderingEnabled && visibleOrPrerender && cycle >= 1 && cycle <= 320) {
-                    //During active sprite evaluation/fetch, $2004 doesn't read real
-                    //OAM through OAMADDR at all - see AccuracyCoin's "Address $2004
-                    //Behavior" (cycles 1-64 and 257-320 always read $FF) and "$2004
-                    //Stress Test" (cycles 65-256 read the live evaluation buffer,
-                    //i.e. whatever byte stepSpriteEvaluation most recently looked at).
-                    if (cycle <= 64) oamVal = 0xFF;
-                    else if (cycle <= 256) oamVal = evalLastReadValue;
-                    else oamVal = 0xFF;
-                } else {
-                    oamVal = oam[oamaddr & 0xFF] & 0xFF;
-                    //The 3rd byte of each 4-byte OAM entry (the attribute byte) only
-                    //physically stores bits 7-6-5 (flip V/H, priority) and 1-0 (palette) -
-                    //bits 4-3-2 don't exist in hardware and always read back as 0.
-                    if ((oamaddr & 0x03) == 2) oamVal &= 0xE3;
-                }
+                //See oamBusValueAtCycle()/OAM_READ_LOOKAHEAD_DOTS: the CPU actually
+                //samples a few dots further into this read than `cycle` shows here.
+                int oamVal = oamBusValueAtCycle(OAM_READ_LOOKAHEAD_DOTS);
                 ppuDataBus = oamVal;
                 ppuDataBusDecay = PPU_BUS_DECAY_TICKS;
                 return (byte) ppuDataBus;
             }
 
             case 0x2007: { //PPUDATA
+                flushPendingV();
                 clockA12(v);
                 byte data = readBuffer;
-                //The internal read buffer is always loaded from what would be at this
-                //VRAM address if it weren't palette RAM - i.e. the underlying nametable
-                //byte a $1000-lower address would read (palette RAM has no such buffer
-                //of its own; only the CPU-visible read is unbuffered/immediate there).
-                readBuffer = (v >= 0x3F00) ? (byte) nametables[mapNametableAddress((v - 0x1000) & 0x2FFF)] : ppuRead(v);
+                //Read buffer always loads from what a $1000-lower address would read
+                //(the underlying nametable byte) - palette RAM has no such buffer; only
+                //the CPU-visible read is unbuffered there.
+                boolean delayedBuffer = (ppumask & 0x18) != 0 && (scanline <= 239 || scanline == 261);
+                if (delayedBuffer) {
+                    ppuDataReadAddr = v;
+                    ppuDataReadDelay = PPUDATA_READ_DELAY_DOTS; //see PPUDATA_READ_DELAY_DOTS
+                } else {
+                    readBuffer = (v >= 0x3F00) ? (byte) nametables[mapNametableAddress((v - 0x1000) & 0x2FFF)] : ppuRead(v);
+                }
 
                 if (v >= 0x3F00) {
                     //Palette reads are unbuffered, upper 2 bits open bus. Greyscale
-                    //(PPUMASK bit 0) is applied on the *read path* out of palette RAM,
-                    //so it masks the value the CPU sees down to the grey column
-                    //($x0/$x10/$x20/$x30) without affecting what's stored - see
-                    //AccuracyCoin "Palette RAM Quirks" tests 6 and 7.
+                    //(PPUMASK bit 0) masks the value on the read path without touching
+                    //what's stored - see AccuracyCoin "Palette RAM Quirks" tests 6/7.
                     int pal = ppuRead(v) & 0x3F;
                     if ((ppumask & 0x01) != 0) pal &= 0x30;
                     data = (byte) (pal | (ppuDataBus & 0xC0));
                 }
 
-                incrementVramAddressAfterCpuAccess();
-                clockA12(v); //v drives the address bus continuously, so the auto-increment itself can pulse A12
+                //The renderer-driven increment (see incrementVramAddressAfterCpuAccess)
+                //also rides the same delayed timing as the read-buffer fill, so
+                //intervening fetch dots during the delay still see the old v. See ppuDataIncPending.
+                if (delayedBuffer) {
+                    ppuDataIncPending = true;
+                } else {
+                    incrementVramAddressAfterCpuAccess();
+                }
+                clockA12(v); //v drives the address bus continuously, so the increment itself can pulse A12
                 ppuDataBus = data & 0xFF;
                 ppuDataBusDecay = PPU_BUS_DECAY_TICKS;
                 return data;
@@ -600,23 +686,10 @@ public class PPU {
                 updateNmiLine(); //toggling bit 7 can raise (or drop) the NMI line immediately
                 if (DEBUG_SPRITE0) System.out.printf("  [write $2000=%02x] scanline=%d cycle=%d%n", val, scanline, cycle);
                 break;
-            case 0x2001: { //PPUMASK
-                boolean wasRendering = (ppumask & 0x18) != 0;
-                ppumask = val;
-                boolean nowRendering = (ppumask & 0x18) != 0;
-                //Turning rendering off partway through a scanline that runs sprite
-                //evaluation leaves the OAM/secondary-OAM datapath mid-transfer. The
-                //current secondary OAM address is latched as a "seed"; the actual
-                //corruption doesn't happen until rendering is switched back on and a
-                //PPU cycle elapses on a visible or pre-render line, at which point OAM
-                //row 0 is copied over row `seed`. See AccuracyCoin "OAM Corruption"
-                //tests 2-4 (3 and 4 check that it is NOT immediate at either edge).
-                if (wasRendering && !nowRendering && (scanline <= 239 || scanline == 261)) {
-                    oamCorruptionSeed = currentSecondaryOamAddr();
-                    oamCorruptionPending = true;
-                }
+            case 0x2001: //PPUMASK - not applied immediately; see PPUMASK_WRITE_DELAY_DOTS
+                pendingMaskValue = val;
+                pendingMaskDelay = PPUMASK_WRITE_DELAY_DOTS;
                 break;
-            }
             case 0x2003: //OAMADDR
                 oamaddr = val;
                 break;
@@ -624,11 +697,9 @@ public class PPU {
                 boolean renderingEnabled = (ppumask & 0x18) != 0;
                 boolean visibleOrPrerender = scanline <= 239 || scanline == 261;
                 if (renderingEnabled && visibleOrPrerender) {
-                    //While rendering is active the sprite-evaluation hardware owns
-                    //OAM, so a CPU write to $2004 never reaches OAM at all. What it
-                    //does do is bump OAMADDR by 4 and then realign it to a sprite
-                    //boundary. See AccuracyCoin "Address $2004 Behavior" tests 6
-                    //(increments by 4), 7 (doesn't write OAM) and A (the AND $FC).
+                    //While rendering, sprite evaluation owns OAM, so a $2004 write never
+                    //reaches it - it only bumps OAMADDR by 4 then realigns to a sprite
+                    //boundary. AccuracyCoin "Address $2004 Behavior" tests 6/7/A.
                     oamaddr = ((oamaddr + 4) & 0xFF) & 0xFC;
                 } else {
                     oam[oamaddr & 0xFF] = data;
@@ -651,27 +722,39 @@ public class PPU {
                 }
                 break;
             case 0x2006: //PPUADDR
+                flushPendingV();
                 if (!addressLatch) {
                     t = (t & 0x00FF) | ((val & 0x3F) << 8);
                     addressLatch = true;
                 } else {
                     t = (t & 0x7F00) | val;
-                    v = t;
-                    clockA12(v);
+                    //The second $2006 write copies t into v a few dots after the CPU
+                    //issues it. During the fetch cadence a fetch's two dots straddle
+                    //this: ALE latches the low byte from old v, and the read dot
+                    //re-derives only the upper 6 bits from new v. AccuracyCoin "Hybrid
+                    //Addresses" aims a write at that gap and checks the spliced address.
+                    if ((ppumask & 0x18) != 0 && (scanline <= 239 || scanline == 261)) {
+                        pendingVValue = t;
+                        pendingVDelay = PPUADDR_WRITE_DELAY_DOTS;
+                    } else {
+                        v = t;
+                        clockA12(v);
+                    }
                     addressLatch = false;
                 }
                 break;
             case 0x2007: //PPUDATA
+                flushPendingV();
                 clockA12(v);
                 ppuWrite(v, data);
                 incrementVramAddressAfterCpuAccess();
-                clockA12(v); //v drives the address bus continuously, so the auto-increment itself can pulse A12
+                clockA12(v); //v drives the address bus continuously, so the increment itself can pulse A12
                 break;
         }
     }
 
-    //Non-mutating register peek for the memory inspector; avoids the read side-effects
-    //(VBlank clear, address latch reset, OAMDATA/PPUDATA auto-increment) that cpuRead triggers.
+    //Non-mutating register peek for the memory inspector; skips the read side-effects
+    //(VBlank clear, latch reset, auto-increment) real cpuRead triggers.
     public byte debugRead(int address) {
         switch (address & 0x0007) {
             case 0: return (byte) ppuctrl;
@@ -686,15 +769,12 @@ public class PPU {
         }
     }
 
-    //Folds a $2000-$3EFF nametable address onto one of the 4 physical 1KB slots in
-    //`nametables`, per the cartridge's current mirroring mode - see Cartridge.MirrorMode.
-    //Matches how real PPU/cartridge wiring ties nametable-select address lines
-    //together: vertical mirroring ties $2000=$2800 and $2400=$2C00 (mirrored
-    //left-right, i.e. horizontal scrolling games like SMB); horizontal mirroring
-    //ties $2000=$2400 and $2800=$2C00 (mirrored top-bottom, vertical scrolling
-    //games); single-screen pins all 4 to one physical table; four-screen keeps all
-    //4 distinct (requires the cartridge to provide the extra 2KB of VRAM itself,
-    //modeled here as just using the rest of this array).
+    //Folds a $2000-$3EFF nametable address onto one of the 4 physical 1KB slots, per
+    //the cartridge's mirroring mode - see Cartridge.MirrorMode. Vertical mirroring ties
+    //$2000=$2800, $2400=$2C00 (horizontal-scrolling games); horizontal mirroring ties
+    //$2000=$2400, $2800=$2C00 (vertical-scrolling games); single-screen pins all 4 to
+    //one table; four-screen keeps all 4 distinct (cartridge supplies the extra 2KB,
+    //modeled as the rest of this array).
     private int physicalNametable(int logicalTable) {
         switch (bus.getMirrorMode()) {
             case HORIZONTAL: return (logicalTable >> 1) & 0x01;
@@ -716,10 +796,8 @@ public class PPU {
         return physicalNametable(logicalTable) * 1024 + within;
     }
 
-    //Debug-only: formats every non-empty OAM entry (Y < $EF, matching the same
-    //cutoff used elsewhere to skip parked/off-screen slots) as index/Y/tile/attr/X,
-    //for the Debug menu's "Dump OAM" item - lets a user report exactly what's in
-    //OAM at the moment a rendering bug is visible, without needing a debugger.
+    //Debug-only: formats every non-empty OAM entry (Y < $EF) as index/Y/tile/attr/X
+    //for the Debug menu's "Dump OAM" item.
     public String dumpOamText() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 64; i++) {
@@ -749,12 +827,9 @@ public class PPU {
     public void ppuWrite(int address, byte data) {
         address &= 0x3FFF;
         if (address <= 0x1FFF) {
-            //CHR space (pattern tables) - not nametable space. This must return here:
-            //falling through into the address<=0x3EFF branch below would ALSO write
-            //this same byte into nametable RAM (0x1FFF <= 0x3EFF), corrupting whatever
-            //nametable tile mapNametableAddress(address & 0x2FFF) happens to land on
-            //every time a $2007 write targets CHR space - e.g. whenever PPUADDR wraps
-            //past $3FFF back down into $0000-$1FFF during a long streamed VRAM update.
+            //CHR space, not nametable space - must return here, or falling through
+            //would also write nametable RAM, corrupting it whenever a $2007 write
+            //targets CHR space (e.g. PPUADDR wrapping past $3FFF back to $0000-$1FFF).
             bus.ppuWriteCartridge(address, data);
             return;
         }
@@ -767,30 +842,68 @@ public class PPU {
         }
     }
 
-    //Advances PPU clock by 1 tick (3 PPU ticks per 1 CPU step). CPU and PPU are
-    //stepped 1:1 alongside each other (see NESEmulator.updateEmulationFrame), so at
-    //any point here the CPU has executed exactly up through this instant - nothing
-    //from "later" in the frame has happened yet.
+    //Advances PPU clock by 1 tick (3 per CPU step, stepped 1:1 - see
+    //NESEmulator.updateEmulationFrame), so nothing "later" in the frame has happened yet.
     //
-    //Visible pixels are produced one dot at a time (cycle 1 = pixel x=0 ... cycle 256
-    //= pixel x=255), matching real hardware's own cycle/scanline timing, instead of
-    //computing an entire scanline in one shot. This matters specifically for
-    //sprite-0-hit: games like SMB poll PPUSTATUS bit 6 and time a mid-frame $2005/$2000
-    //scroll write off *when* the hit fires within the scanline (it's used to split the
-    //status bar from the scrolling playfield). If the hit were set instantly at the
-    //start of the scanline instead of at the real x-position of the overlap, that write
-    //lands too early, desyncs the split permanently, and the CPU's poll loop for the
-    //next hit spins forever since the HUD sprite no longer overlaps opaque background.
+    //Pixels are produced one dot at a time (cycle 1 = x=0 ... cycle 256 = x=255),
+    //matching real hardware, rather than a whole scanline at once - needed for
+    //sprite-0-hit: games like SMB time a mid-frame scroll write off exactly when the
+    //hit fires (splitting the status bar from the playfield). Setting the hit
+    //instantly at scanline start instead of its real x-position desyncs the split permanently.
     //
-    //The v/t loopy-register copies below (cycle 257 horizontal, pre-render-line
-    //280-304 vertical) are what makes that split land correctly: a mid-scanline
-    //$2005/$2000 write only lands in t, so it can't retroactively affect the row
-    //currently being drawn - it only becomes visible in v (and therefore in
-    //getWorldScrollX/Y) once the real hardware moment for latching it arrives.
+    //The v/t loopy copies below (cycle 257 horizontal, pre-render 280-304 vertical)
+    //are what make that split work: a mid-scanline $2005/$2000 write only lands in t,
+    //so it can't retroactively affect the row being drawn.
     private boolean pendingVblNmiEdge = false;
+
+    //A $2001 write doesn't reach rendering on the CPU's issuing dot - the 6502
+    //finishes its cycle first, then the PPU takes a couple more dots to propagate the
+    //mask. AccuracyCoin "BG Serial In" and several "Stale" tests are built on this lag;
+    //applying the write instantly made every such write land early.
+    //4 dots: smallest value matching all known AccuracyCoin $2001-timing tests without
+    //breaking previously-passing ones. Absorbs the rest of the CPU cycle plus the PPU's ~2-dot propagation.
+    private static final int PPUMASK_WRITE_DELAY_DOTS = 4;
+    private int pendingMaskValue = 0;
+    private int pendingMaskDelay = 0;
+
+    //Companion lag for the second $2006 write - see that case in cpuWrite().
+    //3 dots: the remainder of the CPU cycle that issued the write.
+    private static final int PPUADDR_WRITE_DELAY_DOTS = 3;
+    private int pendingVValue = 0;
+    private int pendingVDelay = 0;
+
+    //Flushes an in-flight v write so any other v-dependent access sees it immediately;
+    //the lag stays visible only to the fetch cadence it models.
+    private void flushPendingV() {
+        if (pendingVDelay > 0) {
+            pendingVDelay = 0;
+            v = pendingVValue;
+            clockA12(v);
+        }
+    }
+
+    private void applyPpuMask(int val) {
+        boolean wasRendering = (ppumask & 0x18) != 0;
+        ppumask = val;
+        boolean nowRendering = (ppumask & 0x18) != 0;
+        //Turning rendering off mid-scanline during sprite evaluation leaves the OAM
+        //datapath mid-transfer. The current secondary-OAM address is latched as a
+        //seed; the actual corruption happens later, once rendering resumes on a
+        //visible/pre-render line - see AccuracyCoin "OAM Corruption" tests 2-4.
+        if (wasRendering && !nowRendering && (scanline <= 239 || scanline == 261)) {
+            oamCorruptionSeed = currentSecondaryOamAddr();
+            oamCorruptionPending = true;
+        }
+    }
 
     public void step() {
         cycle++;
+
+        if (pendingMaskDelay > 0 && --pendingMaskDelay == 0) applyPpuMask(pendingMaskValue);
+        if (pendingVDelay > 0 && --pendingVDelay == 0) { v = pendingVValue; clockA12(v); }
+
+        ppuDataReadThisDot = ppuDataReadDelay > 0 && --ppuDataReadDelay == 0;
+        ppuDataReadServiced = false;
 
         if (ppuDataBusDecay > 0) {
             ppuDataBusDecay--;
@@ -807,14 +920,30 @@ public class PPU {
 
         maybePerformOamCorruption();
 
-        //Runs BEFORE renderPixel below (real hardware shifts, then samples, within
-        //the same dot) so that a visible scanline's pixel compositing reads this
-        //dot's own freshly-shifted register state rather than the previous dot's -
-        //see bgFetchAndShiftStep's own comment. Gated on renderingEnabled (bg OR
-        //sprites), not just the background-visible bit, matching AccuracyCoin's
-        //"Rendering Flag Behavior" test 2 (shifters still run with only sprites shown).
+        //Runs before renderPixel below (shift-then-sample, matching real hardware) so
+        //this dot's compositing sees the freshly-shifted state. Gated on
+        //renderingEnabled (bg OR sprites), matching AccuracyCoin "Rendering Flag
+        //Behavior" test 2 (shifters still run with only sprites shown).
         if (renderingEnabled && visibleOrPrerender) {
             bgFetchAndShiftStep(cycle);
+            spriteFetchAleStep(cycle);
+        }
+        //If Read asserted on a dot the fetch cadence wasn't driving ALE on, nothing
+        //hijacked it, so the buffer fills from the address actually requested.
+        if (ppuDataReadThisDot && !ppuDataReadServiced) {
+            int a = ppuDataReadAddr;
+            readBuffer = (a >= 0x3F00) ? (byte) nametables[mapNametableAddress((a - 0x1000) & 0x2FFF)] : ppuRead(a);
+        }
+        if (ppuDataReadThisDot && ppuDataIncPending) {
+            ppuDataIncPending = false;
+            incrementVramAddressAfterCpuAccess();
+        }
+        //Clocked on pre-render too (state machines don't know which scanline they're
+        //on) and with rendering off (free-running counters) - see clockSpriteUnits().
+        if (visibleOrPrerender && cycle >= 1 && cycle <= 256) {
+            clockSpriteUnits(renderingEnabled);
+        } else {
+            java.util.Arrays.fill(sprPixelOut, 0);
         }
 
         if (scanline <= 239) {
@@ -826,27 +955,15 @@ public class PPU {
             }
         }
 
-        //v's Y bits ARE incremented scanline-by-scanline here (incrementY(), at cycle
-        //256), matching real hardware - see incrementY()'s own comment for why that
-        //matters for mid-frame $2006/$2005 Y-scroll writes. The horizontal copy at
-        //cycle 257 similarly lets a mid-scanline $2005/$2000 X-scroll write - e.g.
-        //SMB's status-bar split - take effect starting the next scanline; the vertical
-        //copy only needs to happen once per frame, at the pre-render line, to
-        //(re)establish that per-frame Y baseline after the CPU's own $2006/$2007 VRAM
-        //housekeeping writes during VBlank have been moving v around for unrelated
-        //reasons.
+        //v's Y bits increment scanline-by-scanline here (incrementY(), cycle 256),
+        //matching real hardware - see incrementY() for why that matters for mid-frame
+        //Y-scroll writes. The cycle-257 horizontal copy lets a mid-scanline X-scroll
+        //write (e.g. SMB status-bar split) take effect next scanline; the pre-render
+        //vertical copy re-establishes the per-frame Y baseline after VBlank housekeeping.
         if (renderingEnabled && visibleOrPrerender) {
-            //Real hardware increments v's Y portion (fine Y, carrying into coarse Y,
-            //carrying into a nametable-half toggle) once per scanline at dot 256 - the
-            //same "yyy NN YYYYY XXXXX" v register described above, not a separate
-            //derived value. Doing this for real (instead of the old approach of just
-            //adding the scanline number to whatever Y prepareScanline last read out of
-            //v) is what makes a mid-frame $2006/$2005 Y-scroll write - e.g. the SMB3
-            //title screen's curtain/floor split - land correctly: real hardware treats
-            //such a write as "the Y position starting at this scanline", and every
-            //following scanline increments from there. Adding the absolute scanline
-            //number instead (the old approach) only happened to work when v's Y bits
-            //were set once during VBlank and never touched again mid-frame.
+            //Doing the real per-scanline v increment (instead of adding the scanline
+            //number to whatever Y was last read) is what makes a mid-frame Y-scroll
+            //write (e.g. SMB3 title screen split) land correctly.
             if (cycle == 256) incrementY();
             if (cycle == 257) {
                 v = (v & ~0x041F) | (t & 0x041F); //horizontal bits: coarse X + NT-select X
@@ -854,20 +971,13 @@ public class PPU {
             if (scanline == 261 && cycle >= 280 && cycle <= 304) {
                 v = (v & ~0x7BE0) | (t & 0x7BE0); //vertical bits: fine/coarse Y + NT-select Y
             }
-            //MMC3's IRQ counter is really clocked by rising edges of the PPU address
-            //bus's A12 line, which happen when a pattern-table fetch address crosses
-            //into $1000-$1FFF. This PPU renders per-pixel rather than per-dot-fetch
-            //(see renderPixel's own comment), so the individual per-tile fetch
-            //addresses aren't available, but the two points in the scanline where the
-            //fetch address's pattern-table half can change are known: sprite pattern
-            //fetches for the *next* scanline begin around dot 257 (using ppuctrl bit 3's
-            //sprite pattern table half), and the following scanline's own background
-            //prefetch resumes around dot 321 (using ppuctrl bit 4's BG pattern table
-            //half). Routing both through clockA12() - the same shared A12 state that
-            //$2006/$2007 CPU accesses update (see clockA12's own comment) - means a
-            //rising edge is only counted when the half actually changes, exactly like
-            //real hardware, instead of unconditionally clocking once per scanline
-            //regardless of whether A12 was already high.
+            //MMC3's IRQ counter clocks on A12 rising edges from pattern-table fetch
+            //addresses crossing into $1000-$1FFF. This PPU renders per-pixel, not
+            //per-fetch, but the two points where the fetch address's pattern-table
+            //half can change are known: sprite fetches for the next scanline (~dot
+            //257, ppuctrl bit 3) and the next scanline's BG prefetch (~dot 321,
+            //ppuctrl bit 4). Routing both through clockA12() only counts a rising edge
+            //when the half actually changes, like real hardware.
             if (cycle == 257) {
                 boolean newRenderA12 = ((ppuctrl & 0x08) != 0);
                 if (newRenderA12 && !renderA12 && bus != null) bus.clockMapperIRQ();
@@ -879,51 +989,61 @@ public class PPU {
                 renderA12 = newRenderA12;
             }
 
-            //Real dot-by-dot sprite evaluation (secondary OAM build, cycles 65-256)
-            //and fetch (pattern data for up to 8 slots, cycles 257-320) for whatever
-            //scanline comes next - see startSpriteEvaluation/stepSpriteEvaluation/
-            //fetchSpriteSlot's own comments. Evaluation runs whenever EITHER
-            //background or sprites are enabled (renderingEnabled, i.e. ppumask&0x18),
-            //not just when sprites are - AccuracyCoin's "Rendering Flag Behavior"
-            //test 3 and "Sprite Overflow Behavior" test 4 both depend on evaluation
-            //(and therefore the overflow flag) still happening with only the
-            //background enabled.
-            if (cycle == 65) startSpriteEvaluation(scanline);
-            if (cycle >= 65 && cycle <= 255 && (cycle & 1) == 1) stepSpriteEvaluation();
-            //OAMADDR reads back as 0 continuously during the sprite-fetch window,
-            //regardless of what the CPU last wrote there - real hardware quirk that
-            //AccuracyCoin's OAM-address tests rely on.
+            //Real dot-by-dot sprite evaluation (secondary OAM build, cycles 65-256) and
+            //fetch (cycles 257-320) for the next scanline - see startSpriteEvaluation/
+            //stepSpriteEvaluation/fetchSpriteSlot. Runs whenever bg OR sprites are
+            //enabled - AccuracyCoin "Rendering Flag Behavior" test 3 and "Sprite
+            //Overflow Behavior" test 4 depend on evaluation still happening with only bg enabled.
+            //A $2004 read's lookahead (oamBusValueAtCycle) may already have started
+            //this scanline's evaluation a dot early - only start here if not.
+            if (cycle == 65 && evalStartedForScanline != scanline) {
+                startSpriteEvaluation(scanline);
+                evalStartedForScanline = scanline;
+            }
+            if (cycle >= 65 && cycle <= 255 && (cycle & 1) == 1) {
+                //oamBusValueAtCycle() may have already run this step early on behalf of
+                //a $2004 read - see evalStepsExecuted's comment.
+                int expectedSteps = (cycle - 65) / 2 + 1;
+                if (evalStepsExecuted < expectedSteps) {
+                    stepSpriteEvaluation();
+                    evalStepsExecuted++;
+                }
+            }
+            //OAMADDR reads back as 0 continuously during the sprite-fetch window -
+            //real hardware quirk AccuracyCoin's OAM-address tests rely on.
             if (cycle >= 257 && cycle <= 320) {
                 oamaddr = 0;
-                //nextSpriteCount is normally reset by startSpriteEvaluation at cycle
-                //65, but rendering can toggle on mid-scanline (e.g. via a $2001 write
-                //between 65 and 257) without that having run - resetting again here,
-                //right before the first fetch of the window, keeps a stale count from
-                //a previous scanline from overflowing the 8-slot arrays.
-                if (cycle == 257) nextSpriteCount = 0;
                 if (((cycle - 257) % 8) == 7) fetchSpriteSlot((cycle - 257) / 8);
             }
+            //Dot 339 releases the sprite units back to "counting" for the next
+            //scanline; if rendering is off here, a halted unit paints immediately once
+            //rendering returns - see sprHalted's declaration.
+            if (cycle == 339) java.util.Arrays.fill(sprHalted, false);
         }
 
-        if (cycle >= 341) {
+        //Odd-frame dot skip: with rendering on, every other frame's pre-render line is
+        //one dot short (dot 339 is last, jumps to dot 0 of scanline 0).
+        //Sync_ToPreRenderDot324 (used by several AccuracyCoin tests) detects frame
+        //parity, so without this the CPU/PPU alignment those tests expect is off by one dot.
+        boolean skipLastDot = scanline == 261 && cycle == 340 && oddFrame && renderingEnabled;
+
+        if (cycle >= 341 || skipLastDot) {
             cycle = 0;
             scanline++;
             if (scanline >= 262) {
                 scanline = 0;
+                oddFrame = !oddFrame;
             }
-            //nmiVblLevel drops 1 PPU dot before the CPU-visible $2002 bit does (see
-            //nmiVblLevel's declaration) - right here, at scanline 261 dot 0, one dot
-            //ahead of the dot-1 clear below.
+            //nmiVblLevel drops 1 dot before the CPU-visible $2002 bit - here, at
+            //scanline 261 dot 0, one dot ahead of the dot-1 clear below.
             if (scanline == 261) {
                 nmiVblLevel = false;
                 updateNmiLine();
-                //All three $2002 flags - VBlank, sprite 0 hit, and sprite overflow -
-                //are cleared together on this single dot (dot 0 of the pre-render
-                //line). AccuracyCoin's "$2002 Flag Timing" test 1 confirms they share
-                //one clear point; the apparent skew between VBlank and the sprite
-                //flags in a read's result comes purely from the read's own sampling
-                //skew, modeled in cpuRead's $2002 case, not from separate clear dots.
-                ppustatus &= ~0x60;
+                //$2002 flags themselves are NOT cleared here - all three (VBlank,
+                //sprite 0 hit, overflow) clear together on dot 1 below.
+                //AccuracyCoin "$2002 Flag Timing" test 1 confirms one shared clear
+                //point; the apparent skew in reads comes from M2 sampling skew in
+                //cpuRead's $2002 case, not separate clear dots.
             }
         }
 
@@ -935,128 +1055,98 @@ public class PPU {
             if (!suppressVblSet) {
                 ppustatus |= 0x80; //Set VBlank flag
                 nmiVblLevel = true;
-                pendingVblNmiEdge = true; //the NMI-line's own rising edge lags the $2002-visible flag by 1 ppu dot
+                pendingVblNmiEdge = true; //NMI-line's own rising edge lags the $2002 flag by 1 dot
             }
             suppressVblSet = false;
         }
 
         if (scanline == 261 && cycle == 1) {
             ppustatus &= ~0x80;
-            ppustatus &= ~0x40; //Clear sprite-0-hit for the upcoming frame - real hardware clears
-                                 //VBlank, sprite-0-hit, and sprite overflow together here, NOT at
-                                 //scanline 241 (VBlank start) - clearing the hit flag that early was
-                                 //hiding it from the game before it ever got a chance to read it during
-                                 //VBlank, and (per AccuracyCoin's Sprite 0 Hit Behavior test C) let a
-                                 //stale hit from one frame bleed as a false positive into the next.
-            ppustatus &= ~0x20; //Clear sprite overflow flag for the upcoming frame - real hardware
-                                 //clears VBlank, sprite-0-hit, and sprite overflow together here; this
-                                 //flag was previously only ever set, never cleared, causing anything
-                                 //that polls for it to go low (e.g. Sync_ToSpriteFlagsClearing in
-                                 //AccuracyCoin's $2004 Stress Test) to spin forever.
+            ppustatus &= ~0x40; //Clear sprite-0-hit here (not at VBlank start) - clearing
+                                 //early hid it from the game before it could read it during
+                                 //VBlank, and let a stale hit bleed into the next frame
+                                 //(AccuracyCoin Sprite 0 Hit Behavior test C).
+            ppustatus &= ~0x20; //Clear sprite overflow here too; previously only ever set,
+                                 //never cleared, causing polls for it (e.g.
+                                 //Sync_ToSpriteFlagsClearing) to spin forever.
         }
     }
 
-    //Per-scanline sprite state, populated at cycle 1 (prepareScanline, from whatever
-    //the PREVIOUS scanline's real dot-by-dot evaluation/fetch produced - see
-    //nextSprite* below) and then consumed dot-by-dot by renderPixel as the beam
-    //actually advances across the row.
     private static final int MAX_ROW_SPRITES = 8;
-    private final boolean[] rowSpriteIsZero = new boolean[MAX_ROW_SPRITES]; //true iff this slot is secondary-OAM slot 0
-    private final int[] rowSpriteX = new int[MAX_ROW_SPRITES];
-    private final int[] rowSpritePlane0 = new int[MAX_ROW_SPRITES];
-    private final int[] rowSpritePlane1 = new int[MAX_ROW_SPRITES];
-    private final boolean[] rowSpriteFlipH = new boolean[MAX_ROW_SPRITES];
-    private final boolean[] rowSpriteBehind = new boolean[MAX_ROW_SPRITES];
-    private final int[] rowSpritePaletteGroup = new int[MAX_ROW_SPRITES];
-    private int rowSpriteCount = 0;
 
-    //Real 2C02 secondary OAM (8 sprites x 4 bytes) and the sprite-evaluation state
-    //machine that fills it, run dot-by-dot across cycles 65-256 of every rendering-
-    //enabled visible/pre-render scanline (see stepSpriteEvaluation, called from
-    //step()). This replaces a simpler "evaluate the whole row at once" approach so
-    //that: (a) $2004 reads during 65-256 can reflect the real in-progress evaluation
-    //buffer value (see cpuRead's OAMDATA case), (b) the well-known sprite-overflow
-    //"diagonal" hardware bug is reproduced instead of a clean count-and-stop, and
-    //(c) OAMADDR misalignment quirks (starting evaluation mid-sprite) are modeled
-    //instead of always assuming evaluation starts cleanly on a 4-byte boundary.
+    //Real 2C02 sprite output: eight independent units, each with two 8-bit pattern
+    //shift registers, a latched attribute byte, and a down-counter preloaded with X.
+    //No "compare beam x against sprite x" exists in hardware - AccuracyCoin "Stale
+    //Sprite Shift Regs" probes exactly this: toggling rendering off/on resumes a
+    //half-drained shifter wherever the beam now is, which a positional compare can't reproduce.
     //
-    //Unlike the old model (which just walked the 64 primary-OAM entries as an
-    //int[8] of indices), the real chip has exactly one evaluation pointer -
-    //evalAddr, an 8-bit OAM byte address - and the byte at evalAddr is read/decided
-    //on every step. evalCopyRemaining tracks "how many more bytes of the sprite
-    //currently being copied are left" (0 means the next byte read is treated as a
-    //fresh Y-coordinate decision, not a mid-copy continuation) - matching real
-    //hardware's actual logic instead of separately tracked n/m sprite/byte indices,
-    //which is what lets a misaligned starting OAMADDR "stay misaligned" through an
-    //in-range sprite's copy and then self-realign on the next out-of-range decision,
-    //exactly like AccuracyCoin's "Misaligned OAM Behavior" test expects.
+    //sprHalted is separate from "counter == 0": a unit counts down toward X, or is
+    //halted (actively shifting its 8 pixels). Dot 339 of every rendering scanline
+    //forces all units back to "counting"; if rendering is off then, they stay halted
+    //and paint the instant rendering returns, regardless of X. Tests 5/6 of "Stale
+    //Sprite Shift Regs" are built around that one dot.
+    private final int[] sprShiftLo = new int[MAX_ROW_SPRITES];
+    private final int[] sprShiftHi = new int[MAX_ROW_SPRITES];
+    private final int[] sprAttrLatch = new int[MAX_ROW_SPRITES];
+    private final int[] sprCounter = new int[MAX_ROW_SPRITES];
+    private final boolean[] sprHalted = new boolean[MAX_ROW_SPRITES];
+    private final boolean[] sprIsZero = new boolean[MAX_ROW_SPRITES];
+    //This dot's output from each unit, produced by clockSpriteUnits() before
+    //renderPixel composites it - kept separate since the registers have already
+    //advanced by the time the pixel is resolved.
+    private final int[] sprPixelOut = new int[MAX_ROW_SPRITES];
+
+    //Real 2C02 secondary OAM (8x4 bytes) and the evaluation state machine filling it,
+    //run dot-by-dot across cycles 65-256 (see stepSpriteEvaluation, called from
+    //step()). This replaces a simpler "evaluate the whole row at once" approach so
+    //that: (a) $2004 reads during 65-256 reflect the real in-progress buffer, (b) the
+    //sprite-overflow "diagonal" bug is reproduced, and (c) OAMADDR misalignment quirks
+    //are modeled instead of assuming a clean 4-byte boundary.
+    //
+    //Real chip has exactly one evaluation pointer - evalAddr - decided fresh every
+    //step, rather than separate sprite/byte indices. evalCopyRemaining tracks bytes
+    //left in the sprite currently being copied (0 = next byte is a fresh Y decision) -
+    //this is what lets a misaligned starting OAMADDR "stay misaligned" through a copy
+    //and self-realign on the next out-of-range decision (AccuracyCoin "Misaligned OAM Behavior").
     private final byte[] secondaryOam = new byte[32];
     private int evalAddr;
     private int evalCopyRemaining;
     private int evalSecCount;       //0-8: sprites committed into secondaryOam so far this evaluation
-    private int evalSpritesScanned; //safety cutoff once all 64 primary sprites have been decided on, so a scanline with few sprite matches doesn't spin evaluation state forever
-    private int evalLastReadValue;  //the most recently read (and attribute-masked) OAM byte - what $2004 reflects during cycles 65-256
-    private int evalTargetScanline; //the scanline this evaluation's results are FOR (next scanline, or 0 during pre-render)
+    private int evalSpritesScanned; //safety cutoff once all 64 primary sprites are decided
+    private int evalLastReadValue;  //most recently read (attribute-masked) OAM byte - what $2004 reflects during 65-256
+    private int evalTargetScanline; //scanline this evaluation is FOR (next scanline, or 0 during pre-render)
     private boolean evalActive;
 
-    //"Sprite zero" is not "whatever ended up in secondary OAM slot 0" - it is set by a
-    //dedicated flag that the hardware raises only if the VERY FIRST object evaluated
-    //this scanline (the one decided on PPU cycle 66) turned out to be in range. If
-    //that first object is out of range and some later object becomes slot 0 instead,
-    //slot 0 is NOT sprite zero and cannot trigger a sprite zero hit. Conversely, a
-    //write to $2003 before evaluation starts makes evaluation begin at a non-zero
-    //OAM index, and whatever object it lands on first becomes "sprite zero" even
-    //though it isn't OAM index 0. See AccuracyCoin "Arbitrary Sprite Zero" tests 1-2.
+    //"Sprite zero" is set only if the VERY FIRST object evaluated this scanline
+    //(decided at cycle 66) was in range - not "whatever landed in slot 0". If that
+    //first object is out of range, slot 0 is NOT sprite zero. A $2003 write before
+    //evaluation starts can make a non-zero OAM index become "sprite zero" instead.
+    //See AccuracyCoin "Arbitrary Sprite Zero" tests 1-2.
     private boolean evalFirstStep;
     private boolean evalSpriteZeroInRange;
-    private boolean nextSpriteZeroPresent;
 
-    //Results of the evaluation+fetch that ran during the PREVIOUS scanline's cycles
-    //65-320, swapped into rowSprite*/rowSpriteCount at the start of THIS scanline
-    //(see prepareScanline). Built incrementally: stepSpriteEvaluation fills
-    //secondaryOam across 65-256, then fetchSpriteSlot reads pattern data out of it
-    //into these arrays across 257-320 (8 cycles per slot), sampling PPUCTRL at each
-    //slot's own fetch cycle rather than once for the whole scanline - so a
-    //mid-fetch-window $2000 write (AccuracyCoin's "Suddenly Resize Sprite" tests)
-    //can actually change which slots see tall vs. short sprites.
-    private final boolean[] nextSpriteIsZero = new boolean[MAX_ROW_SPRITES];
-    private final int[] nextSpriteX = new int[MAX_ROW_SPRITES];
-    private final int[] nextSpritePlane0 = new int[MAX_ROW_SPRITES];
-    private final int[] nextSpritePlane1 = new int[MAX_ROW_SPRITES];
-    private final boolean[] nextSpriteFlipH = new boolean[MAX_ROW_SPRITES];
-    private final boolean[] nextSpriteBehind = new boolean[MAX_ROW_SPRITES];
-    private final int[] nextSpritePaletteGroup = new int[MAX_ROW_SPRITES];
-    private int nextSpriteCount = 0;
     private boolean rowShowBackground;
     private boolean rowShowSprites;
     private boolean rowShowLeftBackground;
     private boolean rowShowLeftSprites;
-    private int rowBackdropRgb;
-    //Real 2C02 background pipeline: two 16-bit pattern shift registers (low/high
-    //bitplane) and two 16-bit attribute shift registers (each bit pre-expanded to
-    //either all-0s or all-1s for the tile it came from), shifted left once per dot
-    //during rendering (see updateBgShifters) and reloaded with the next tile's data
-    //in their low byte every 8 dots (see loadBgShifters). bgNext* latches hold the
-    //tile currently being fetched (nametable byte -> attribute byte -> pattern low
-    //-> pattern high, 2 dots each, driven by bgFetchAndShiftStep) until that reload
-    //moment. This replaces the old "cache a whole tile once per 8 pixels, keyed off
-    //world-space X" approximation with the real per-dot state machine - which is
-    //what several AccuracyCoin tests (t Register Quirks, Stale BG Shift Registers,
-    //BG Serial In, $2007 Stress Test, ALE + Read, Hybrid Addresses...) directly probe.
-    //Fetches still go through ppuRead/PPUCTRL exactly like before, so MMC3 CHR-bank/
-    //pattern-table-bit mid-scanline switches (e.g. SMB3's status-bar split) are still
-    //picked up per-tile - now even more precisely, since the low/high pattern bytes
-    //are fetched at their own real dot (cycle%8==5/7) rather than at "first pixel of
-    //an 8px block".
+    private int rowBackdropPaletteIdx;
+    //Real 2C02 background pipeline: two 16-bit pattern shift registers and two 16-bit
+    //attribute shift registers (each bit pre-expanded to all-0/all-1), shifted once
+    //per dot (updateBgShifters) and reloaded every 8 dots (loadBgShifters). bgNext*
+    //latches hold the tile currently being fetched until reload. Replaces the old
+    //"cache a tile every 8 pixels" approximation with the real per-dot state machine -
+    //what several AccuracyCoin tests (t Register Quirks, Stale BG Shift Registers, BG
+    //Serial In, $2007 Stress Test, ALE + Read, Hybrid Addresses) directly probe.
+    //Fetches still go through ppuRead/PPUCTRL, so MMC3 mid-scanline CHR/pattern-table
+    //switches (SMB3 status bar) are still picked up per-tile, now at their real dot.
     private int bgNextTileId, bgNextAttr, bgNextLsb, bgNextMsb;
     private int bgShiftPatternLo, bgShiftPatternHi;
     private int bgShiftAttrLo, bgShiftAttrHi;
 
-    //Latches this scanline's render-affecting PPU state and evaluates sprites for the
-    //row (real hardware does this during cycles 65-256 of the *previous* scanline, but
-    //since nothing here reads OAM/PPUCTRL mid-evaluation, doing it up front at cycle 1
-    //of this scanline is behaviorally equivalent and simpler). Actual pixel output and
-    //the sprite-0-hit comparison happen later, dot-by-dot, in renderPixel.
+    //Latches this scanline's render state and evaluates sprites for the row up front
+    //at cycle 1 (real hardware does this during the PREVIOUS scanline's 65-256, but
+    //since nothing here reads OAM/PPUCTRL mid-evaluation, doing it up front is
+    //equivalent and simpler). Pixel output and sprite-0-hit happen later in renderPixel.
     private void prepareScanline(int sy) {
         if (DEBUG_SPRITE0 && sy <= 35) {
             System.out.printf("prepareScanline sy=%d ppuctrl=%02x scrollX=%d scrollY=%d%n", sy, ppuctrl, scrollX, scrollY);
@@ -1066,83 +1156,214 @@ public class PPU {
         rowShowLeftBackground = (ppumask & 0x02) != 0;
         rowShowLeftSprites = (ppumask & 0x04) != 0;
 
-        rowBackdropRgb = NES_PALETTE[ppuRead(0x3F00) & 0x3F];
-
-        //This scanline's sprites were already evaluated+fetched dot-by-dot during
-        //the PREVIOUS scanline's cycles 65-320 (see stepSpriteEvaluation/
-        //fetchSpriteSlot, driven from step()) - just adopt those results now. Stored
-        //highest-fetch-order-first (slot 7 first, if present) so that iterating
-        //n=count-1 down to 0 in renderPixel visits slot 0 (real priority winner, and
-        //the only slot that can ever be "sprite zero") last, matching the old
-        //array's "lower index composited on top" convention.
-        rowSpriteCount = 0;
-        for (int slot = MAX_ROW_SPRITES - 1; slot >= 0; slot--) {
-            if (slot >= nextSpriteCount) continue;
-            int n = rowSpriteCount++;
-            rowSpriteIsZero[n] = nextSpriteIsZero[slot];
-            rowSpriteX[n] = nextSpriteX[slot];
-            rowSpritePlane0[n] = nextSpritePlane0[slot];
-            rowSpritePlane1[n] = nextSpritePlane1[slot];
-            rowSpriteFlipH[n] = nextSpriteFlipH[slot];
-            rowSpriteBehind[n] = nextSpriteBehind[slot];
-            rowSpritePaletteGroup[n] = nextSpritePaletteGroup[slot];
-        }
+        rowBackdropPaletteIdx = ppuRead(0x3F00) & 0x3F;
+        //No sprite state copied here any more - the eight output units carry their
+        //own state across scanline boundaries (see sprHalted), so re-seeding them
+        //would destroy the staleness "Stale Sprite Shift Regs"/"Sprites On Scanline 0" test for.
     }
 
-    //Starts a fresh sprite evaluation for whatever scanline follows `sy` (or
-    //scanline 0, if sy is the pre-render line) - called once at cycle 65 of every
-    //rendering-enabled visible/pre-render scanline. evalAddr begins at the CPU's
-    //current OAMADDR (not forced to a 4-byte boundary) - see this class's evalAddr
-    //field comment for why that's what makes OAM-misalignment quirks come out right.
+    //Starts a fresh sprite evaluation for the scanline after `sy` (or 0, if sy is
+    //pre-render) - called at cycle 65. evalAddr begins at the CPU's current OAMADDR
+    //(not forced to a 4-byte boundary) - see evalAddr's field comment.
     private void startSpriteEvaluation(int sy) {
         java.util.Arrays.fill(secondaryOam, (byte) 0xFF);
         evalAddr = oamaddr & 0xFF;
         evalCopyRemaining = 0;
         evalSecCount = 0;
         evalSpritesScanned = 0;
+        evalStepsExecuted = 0;
+        evalAddrTotalAdvance = 0;
+        evalSecWriteFrozen = false;
+        evalOverflowInitialized = false;
+        evalOverflowState = 0;
+        evalOverflowFreezeStep = 0;
+        evalOverflowNWrapped = false;
         evalTargetScanline = (sy == 261) ? 0 : sy + 1;
         evalActive = true;
         evalFirstStep = true;
         evalSpriteZeroInRange = false;
-        nextSpriteCount = 0;
     }
 
-    //Runs one 2-PPU-cycle evaluation step (one primary-OAM byte decided) - called on
-    //every odd cycle from 65 to 255 inclusive (96 steps total, matching real
-    //hardware's throughput for this 192-cycle window). Implements the real 2C02
-    //algorithm off a single evalAddr pointer rather than independent sprite/byte
-    //indices: an in-range sprite's remaining 3 bytes are just copied by walking
-    //evalAddr forward one byte at a time (which is what lets a misaligned starting
-    //address stay misaligned through the copy), an out-of-range Y realigns evalAddr
-    //to the next 4-byte boundary via (addr+4)&0xFC, and once 8 sprites are already
-    //committed, evaluation switches to the buggy "overflow scan" - every remaining
-    //step just advances evalAddr by a flat 5 (the well-known n-and-m-both-increment
-    //hardware bug) while still checking for (and setting) the overflow flag.
-    //Advances the single evaluation pointer, ending the whole evaluation if it runs
-    //off the end of OAM. Sprite evaluation stops when the OAM address wraps past $FF -
-    //it does NOT roll around to $00 and start re-reading the low sprites. Letting it
-    //wrap made the post-full "overflow scan" (which strides by 5 and so lands on
-    //non-Y bytes) come back around into real sprite data and raise a bogus sprite
-    //overflow flag - AccuracyCoin "Sprite Overflow Behavior" test 3 checks exactly
-    //that 8 in-range sprites leave the flag clear.
+    //How many of the 96 evaluation steps (odd cycles 65-255) have run this scanline.
+    //Normally trails `cycle` naturally, but oamBusValueAtCycle() can run steps early
+    //(to answer "what would $2004 return a few dots from now"), so this counter stops
+    //the real per-dot driver from double-running an already-executed step.
+    private int evalStepsExecuted;
+
+    //Which scanline startSpriteEvaluation has already run for - lets both the real
+    //per-dot driver (cycle==65) and oamBusValueAtCycle's one-dot lookahead start a
+    //scanline's evaluation exactly once, whichever gets there first.
+    private int evalStartedForScanline = -1;
+
+    //$2004's true read latency: the CPU's read cycle begins 1 dot after `cycle`, and
+    //OAMDATA has no buffering (unlike $2007) - so the value sampled is a few dots
+    //further along than `cycle` shows here. AccuracyCoin "$2004 Stress Test" reads
+    //every dot of a scanline against a precomputed table that only lines up with this lookahead.
+    private static final int OAM_READ_LOOKAHEAD_DOTS = 1;
+
+    //Answers "what would $2004 return `aheadDots` dots from now" without side effects
+    //a real read wouldn't have - except evaluation steps within the lookahead window
+    //are actually executed early (see evalStepsExecuted), since they'll happen regardless.
+    private int oamBusValueAtCycle(int aheadDots) {
+        int target = cycle + aheadDots;
+        int targetScanline = scanline;
+        if (target > 340) {
+            target -= 341;
+            targetScanline++;
+            if (targetScanline >= 262) targetScanline = 0;
+        }
+        boolean targetVisibleOrPrerender = targetScanline <= 239 || targetScanline == 261;
+        boolean renderingEnabled = (ppumask & 0x18) != 0;
+        if (!renderingEnabled || !targetVisibleOrPrerender || target < 0 || target > 340) {
+            return plainOamRead();
+        }
+        if (target == 0) {
+            //Dot 0: secondary OAM hasn't been reset yet (happens at dot 65), so the
+            //buffer still shows slot 0's byte from two scanlines ago's fetch phase.
+            return secondaryOam[0] & 0xFF;
+        }
+        //Dots 1-64: secondary-OAM clear (32 steps, 2 dots each writing $FF), bus shows
+        //that constant. Dot 65 is step 1's own first dot, already run by the real
+        //per-dot driver by the time it's sampled - only looked like part of the clear
+        //phase before because that scenario's OAM[0] happened to be $FF (key 2, OAM[0]=$80, exposes the difference).
+        if (target >= 1 && target <= 64) return 0xFF; //secondary-OAM clear glitch
+        if (target >= 65 && target <= 256) {
+            //target==65 is the only way this can run before the real driver's own
+            //cycle==65 handler starts evaluation for this scanline - without this
+            //guard, steps below would use evalAddr/evalStepsExecuted left over from
+            //the previous scanline instead of a fresh reset.
+            if (targetScanline == scanline && evalStartedForScanline != scanline) {
+                startSpriteEvaluation(scanline);
+                evalStartedForScanline = scanline;
+            }
+            //Run any steps the real driver hasn't reached yet, then credit them so it
+            //doesn't repeat the work.
+            int expectedSteps = Math.min(96, (Math.min(target, 255) - 65) / 2 + 1);
+            while (evalStepsExecuted < expectedSteps) {
+                stepSpriteEvaluation();
+                evalStepsExecuted++;
+            }
+            //Once the pointer has lapped OAM within one scanline's window
+            //(evalAddrTotalAdvance >= 256), evaluation and secondary-OAM-write fall
+            //out of sync: a second read mid-step no longer echoes evalLastReadValue -
+            //it instead reads secondary OAM's own current write address.
+            //AccuracyCoin's "$2004 Stress Test" answer key (section 6) documents this:
+            //"value, value" pairs become "value, <secondary-OAM byte>" once lapped.
+            //After the pointer laps, the first dot of a step's pair (odd target,
+            //freshly-executed step) still shows the real comparator read; the second
+            //dot (even target, no new step) instead reads secondary OAM's write address.
+            //The same fall-out-of-sync applies once 8 sprites are committed
+            //(overflow-scan phase): secondary OAM's write pointer is done moving
+            //(evalSecCount stays 8), so its address/byte are fixed for the rest of the
+            //scanline even as the comparator keeps reading fresh bytes. AccuracyCoin
+            //answer key 2 (more-than-8-in-range) shows a constant byte on every second
+            //dot once the 8 real sprites are found.
+            //evalSecCount is bumped to 8 the moment the 8th sprite is CONFIRMED
+            //in-range, but its remaining 3 bytes are still a normal copy for a few more
+            //steps - checking evalCopyRemaining>0 avoids freezing 4 steps too early
+            //while those bytes are still being copied (AccuracyCoin key-2 table).
+            if ((evalSecWriteFrozen || evalWasOverflowScanRead) && !evalLastStepWasMidCopy && (target & 1) == 0) {
+                return secondaryOam[(evalSecCount * 4) & 0x1F] & 0xFF;
+            }
+            return evalLastReadValue;
+        }
+        if (target >= 257 && target <= 320) {
+            int slot = (target - 257) / 8;
+            int into = (target - 257) % 8;
+            return secondaryOam[(slot * 4 + Math.min(3, into)) & 0x1F] & 0xFF;
+        }
+        //Dots 321-340: past the last fetch slot, address bus settles back on secondary
+        //OAM's slot-0 byte (mirrors target==0 above) rather than primary OAM -
+        //AccuracyCoin calls these "20 instances of $7F (index 0 into OAM2)".
+        if (target >= 321 && target <= 340) {
+            return secondaryOam[0] & 0xFF;
+        }
+        return plainOamRead();
+    }
+
+    //Attribute byte (3rd of each 4-byte entry) only physically stores bits 7-6-5
+    //(flip V/H, priority) and 1-0 (palette) - bits 4-3-2 don't exist and read as 0.
+    private int plainOamRead() {
+        int val = oam[oamaddr & 0xFF] & 0xFF;
+        if ((oamaddr & 0x03) == 2) val &= 0xE3;
+        return val;
+    }
+
+    //Runs one 2-dot evaluation step (one primary-OAM byte decided), called on every
+    //odd cycle 65-255 (96 steps total). Implements the real algorithm off a single
+    //evalAddr pointer: an in-range sprite's remaining 3 bytes are copied by walking
+    //evalAddr forward (which is what keeps a misaligned start misaligned through the
+    //copy), an out-of-range Y realigns to the next 4-byte boundary via (addr+4)&0xFC,
+    //and once 8 sprites are committed, evaluation switches to the buggy "overflow
+    //scan" - every step advances evalAddr by a flat 5 (n-and-m-both-increment bug)
+    //while still checking for/setting the overflow flag.
+    //Advances the evaluation pointer, halting the WHOLE evaluation if it runs off the
+    //end of OAM - only the overflow-scan phase actually reaches this: since it strides
+    //by 5, wrapping to $00 would land on real sprite data and raise a bogus overflow
+    //flag (AccuracyCoin "Sprite Overflow Behavior" test 3: 8 in-range sprites leave the flag clear).
     private void advanceEvalAddr(int delta) {
         int next = evalAddr + delta;
         if (next > 0xFF) evalActive = false;
         evalAddr = next & 0xFF;
+        evalAddrTotalAdvance += delta;
+    }
+
+    //How far the evaluation pointer has moved this scanline, ignoring $FF wrap (keeps
+    //counting past 256). Once past a full OAM pass (256), $2004 reads start
+    //alternating primary-OAM value and secondary OAM's own address (see
+    //oamBusValueAtCycle) - real hardware's evaluation/write circuits fall out of sync
+    //once the pointer laps within one scanline's window.
+    private int evalAddrTotalAdvance;
+
+    //Set the moment evalAddrTotalAdvance first laps a full OAM pass (256) with fewer
+    //than 8 sprites committed - from then on the speculative Y-copy write to secondary
+    //OAM is suppressed, freezing secondaryOam[evalSecCount*4] at whatever it held at
+    //the lap. The comparator keeps reading fresh bytes regardless; only the write
+    //stops. AccuracyCoin's "$2004 Stress Test" answer key (section 6) shows this.
+    private boolean evalSecWriteFrozen;
+
+    //Whether the most recently EXECUTED step was a mid-sprite-copy continuation rather
+    //than a fresh comparator check - must key off this, not the post-step
+    //evalCopyRemaining value, since the copy step that brings it to 0 is still itself
+    //a normal copy step (AccuracyCoin key-2: the 8th sprite's last copied byte appears
+    //on both dots of its step; checking post-step value would freeze a dot early).
+    private boolean evalLastStepWasMidCopy;
+
+    //Whether the most recently executed step was a genuine overflow-scan candidate
+    //check - secondary OAM was ALREADY full before this step, not the step that just
+    //filled it. Only these get the frozen second-dot read; see stepSpriteEvaluation.
+    private boolean evalWasOverflowScanRead;
+
+    //Overflow-scan's n/m state machine - see stepSpriteEvaluation's `else` branch.
+    //evalOverflowState: 0 = default buggy dual increment, 1 = 3-step "confirmation"
+    //after the first in-range hit, 2 = final pinned mode (m stays 0, only n increments).
+    private boolean evalOverflowInitialized;
+    private int evalOverflowN, evalOverflowM, evalOverflowState, evalOverflowFreezeStep;
+
+    //Set once evalOverflowN wraps past 63 back to 0 (a full OAM lap) - the overflow
+    //flag must not spuriously raise on a second lap re-encountering already-committed
+    //sprites' Y bytes. Real hardware's flag only latches on n's first pass, even
+    //though the bus keeps cycling (per AccuracyCoin "$2004 Stress Test" key2).
+    private boolean evalOverflowNWrapped;
+
+    //Companion to advanceEvalAddr() for the earlier phases (mid-copy, out-of-range
+    //realign) - the pointer keeps running the full 96 steps regardless of $FF wrap;
+    //only overflow-scan's wrap halts early. AccuracyCoin "$2004 Stress Test" (key 1)
+    //expects evalLastReadValue to keep changing well past the first wrap.
+    private void advanceEvalAddrWrap(int delta) {
+        evalAddr = (evalAddr + delta) & 0xFF;
+        evalAddrTotalAdvance += delta;
     }
 
     //Pending OAM corruption armed by switching rendering off mid-scanline, and the
-    //secondary OAM address that was latched at that moment. See cpuWrite's $2001 case.
+    //secondary OAM address latched at that moment. See cpuWrite's $2001 case.
     private boolean oamCorruptionPending = false;
     private int oamCorruptionSeed = 0;
 
     //Where the secondary OAM write pointer currently sits (0-$1F), reconstructed from
-    //the dot. Dots 1-64 are the secondary-OAM clear, which walks the pointer one step
-    //every two dots. Dots 65-256 are evaluation, where the pointer tracks the entry
-    //being filled - real hardware "ceilings" a corruption seed taken here to a
-    //multiple of 4, which falls out of using the committed-sprite count. Dots 257-320
-    //are the sprite fetch, whose 8-dot loop advances the pointer on its first three
-    //dots and then holds.
+    //the dot: dots 1-64 clear (pointer advances every 2 dots), 65-256 evaluation
+    //(tracks entry being filled, ceilinged to a multiple of 4), 257-320 sprite fetch
+    //(advances on first three dots of each 8-dot slot, then holds).
     private int currentSecondaryOamAddr() {
         if (cycle >= 1 && cycle <= 64) return (cycle - 1) / 2;
         if (cycle >= 65 && cycle <= 256) return (evalSecCount * 4) & 0x1F;
@@ -1169,40 +1390,43 @@ public class PPU {
         boolean tall = (ppuctrl & 0x20) != 0;
         int spriteHeight = tall ? 16 : 8;
 
+        //Captured before this step can bump evalSecCount to 8 - the step confirming
+        //the 8th in-range sprite is still a fresh comparator read (its second dot
+        //naturally echoes the value), not yet the frozen overflow-scan read that only
+        //applies once secondary OAM was ALREADY full going in.
+        boolean wasOverflowScanBeforeThisStep = evalCopyRemaining == 0 && evalSecCount >= 8;
+
         int m = evalAddr & 0x03;
         int val = oam[evalAddr & 0xFF] & 0xFF;
         if (m == 2) val &= 0xE3; //attribute byte: bits 2-4 don't physically exist
         evalLastReadValue = val;
+        evalWasOverflowScanRead = wasOverflowScanBeforeThisStep;
 
-        //Mid-copy continuation is checked FIRST, independent of evalSecCount: the
-        //moment an 8th sprite is found in-range, evalSecCount is bumped to 8 right
-        //away (see the `inRange` branch below) so that a 9th sprite would correctly
-        //enter overflow-scan mode - but the 8th sprite ITSELF still has 3 more bytes
-        //left to copy at that point, and those must still go through the normal
-        //byte-copy path, not be misread as fresh overflow-scan Y-checks.
+        //Mid-copy is checked first, independent of evalSecCount: once an 8th sprite is
+        //found in-range, evalSecCount jumps to 8 right away (so a 9th correctly enters
+        //overflow-scan), but the 8th sprite itself still has 3 bytes left to copy
+        //normally, not be misread as fresh overflow-scan checks.
+        evalLastStepWasMidCopy = evalCopyRemaining > 0;
         if (evalCopyRemaining > 0) {
-            //The destination offset within the secondary-OAM entry is SEQUENTIAL
-            //(1, 2, then 3 as evalCopyRemaining counts 3, 2, 1) - it is not the
-            //physical evalAddr's low bits. Those two coincide only when evaluation
-            //started on a 4-byte boundary; with a misaligned OAMADDR they diverge, and
-            //using the physical low bits filed the tile byte into the attribute slot.
-            //Note the bits-2-to-4 mask above DOES key off the physical address, which
-            //is why a misaligned read of a tile byte loses those bits - see
-            //AccuracyCoin "Arbitrary Sprite Zero" test 3, which picks tile $E3
-            //precisely so it survives that mask.
+            //Destination offset within the secondary-OAM entry is SEQUENTIAL (1,2,3 as
+            //evalCopyRemaining counts down), not evalAddr's physical low bits - they
+            //only coincide on a 4-byte-aligned start; a misaligned OAMADDR diverges
+            //them (using physical bits filed the tile byte into the attribute slot).
+            //Note the bits-2-4 mask above DOES key off the physical address, so a
+            //misaligned tile-byte read loses those bits - see AccuracyCoin "Arbitrary
+            //Sprite Zero" test 3 (tile $E3 chosen to survive that mask).
             secondaryOam[(evalSecCount - 1) * 4 + (4 - evalCopyRemaining)] = (byte) val;
-            advanceEvalAddr(1);
+            advanceEvalAddrWrap(1);
             evalCopyRemaining--;
         } else if (evalSecCount < 8) {
-            secondaryOam[evalSecCount * 4] = (byte) val; //speculative Y copy; only meaningful if in range
-            //OAM's Y byte is the sprite's top row MINUS 1 (a sprite at Y=0 first
-            //displays on scanline 1, not 0 - see fetchSpriteSlot's matching `y + 1`),
-            //so the in-range check has to compare against val+1, not val itself.
+            if (!evalSecWriteFrozen) secondaryOam[evalSecCount * 4] = (byte) val; //speculative Y copy; only meaningful if in range
+            //OAM's Y byte is the sprite's top row MINUS 1 (Y=0 first displays on
+            //scanline 1) - see fetchSpriteSlot's matching `y + 1`.
             int diff = evalTargetScanline - (val + 1);
             boolean inRange = diff >= 0 && diff < spriteHeight;
             evalSpritesScanned++;
-            //Only the object decided on the very first evaluation step can ever be
-            //sprite zero - see evalSpriteZeroInRange's declaration.
+            //Only the object decided on the very first step can ever be sprite zero -
+            //see evalSpriteZeroInRange's declaration.
             if (evalFirstStep && inRange) evalSpriteZeroInRange = true;
             evalFirstStep = false;
             if (inRange) {
@@ -1210,46 +1434,78 @@ public class PPU {
                 evalSecCount++;
                 advanceEvalAddr(1);
             } else {
-                //Out of range: skip to the next object and realign to a 4-byte
-                //boundary. The AND is only observable when OAMADDR was misaligned -
-                //see AccuracyCoin "Misaligned OAM Behavior" test 2.
-                if (evalAddr + 4 > 0xFF) evalActive = false;
-                evalAddr = (evalAddr + 4) & 0xFC;
+                //Out of range: skip to next object, realign to a 4-byte boundary. The
+                //AND is only observable when OAMADDR was misaligned - see AccuracyCoin
+                //"Misaligned OAM Behavior" test 2. Wraps rather than halting.
+                evalAddr = (evalAddr + 4) & 0xFF & 0xFC;
+                evalAddrTotalAdvance += 4;
             }
+            if (evalAddrTotalAdvance >= 256 && evalSecCount < 8) evalSecWriteFrozen = true;
         } else {
             int diff = evalTargetScanline - (val + 1); //see the +1 note above
             boolean inRange = diff >= 0 && diff < spriteHeight;
-            if (inRange) ppustatus |= 0x20; //sprite overflow flag
-            advanceEvalAddr(5); //the hardware bug: n AND m both advance, unconditionally
+            //Only honored on n's first lap - see evalOverflowNWrapped's comment.
+            if (inRange && !evalOverflowNWrapped) ppustatus |= 0x20; //sprite overflow flag
+
+            if (!evalOverflowInitialized) {
+                //evalAddr already holds the real next candidate - the last in-range
+                //copy's advanceEvalAddrWrap(1) left it there. m starts from evalAddr's
+                //own low bits (not forced to 0) since a misaligned start stays
+                //misaligned through evaluation - see AccuracyCoin "Misaligned OAM Behavior".
+                evalOverflowN = (evalAddr >> 2) & 0x3F;
+                evalOverflowM = evalAddr & 0x03;
+                evalOverflowState = 0;
+                evalOverflowInitialized = true;
+            }
+            //n and m both advancing unconditionally (m should stay 0 but doesn't) is
+            //the default overflow-scan behavior (state 0). AccuracyCoin key-2 (the
+            //>8-real-sprites case) shows the first in-range hit during overflow-scan
+            //sends hardware through 3 more "confirmation" reads at m=1,2,0 with n
+            //fixed, then settles into a pinned mode (state 2) where m stays 0 and only
+            //n increments - hardware self-corrects to the non-buggy algorithm.
+            //Captured empirically against the answer table, not independently verified
+            //against hardware docs.
+            int prevOverflowState = evalOverflowState;
+            int nBeforeAdvance = evalOverflowN;
+            if (prevOverflowState == 2) {
+                evalOverflowN = (evalOverflowN + 1) & 0x3F;
+                //evalOverflowM already 0 and stays that way.
+            } else if (prevOverflowState == 1) {
+                int[] confirmM = {1, 2, 0};
+                evalOverflowM = confirmM[evalOverflowFreezeStep];
+                evalOverflowFreezeStep++;
+                if (evalOverflowFreezeStep == 3) evalOverflowState = 2;
+                //evalOverflowN stays fixed for the whole confirmation sequence.
+            } else {
+                evalOverflowN = (evalOverflowN + 1) & 0x3F;
+                evalOverflowM = (evalOverflowM + 1) & 0x03;
+            }
+            if (evalOverflowN < nBeforeAdvance) evalOverflowNWrapped = true;
+            if (inRange && prevOverflowState == 0) {
+                evalOverflowState = 1;
+                evalOverflowFreezeStep = 0;
+            }
+            evalAddr = (evalOverflowN * 4 + evalOverflowM) & 0xFF;
+            evalAddrTotalAdvance += 5;
         }
     }
 
-    //Reads pattern data for one of the (up to) 8 secondary-OAM slots into
-    //nextSprite*, called at the LAST of each slot's 8 fetch cycles (264, 272, ...,
-    //320) so that PPUCTRL's tall-sprite/pattern-table bits are sampled as late as
-    //real per-slot fetch timing allows, rather than once for the whole scanline.
-    //A slot whose Y byte is still $FF (never claimed by evaluation - either fewer
-    //than 8 sprites matched, or evaluation hadn't reached it) fetches as fully
-    //transparent, matching a real "unused" secondary OAM slot's harmless garbage fetch.
+    //Loads one sprite output unit from its secondary-OAM slot, at the last of each
+    //slot's 8 fetch cycles (264,272,...,320) so PPUCTRL's tall-sprite/pattern-table
+    //bits are sampled as late as real per-slot timing allows.
+    //A slot whose Y is still $FF (unclaimed by evaluation) fetches fully transparent,
+    //matching a real unused slot's harmless garbage fetch.
     private void fetchSpriteSlot(int slot) {
         int base = slot * 4;
         int y = secondaryOam[base] & 0xFF;
-        //Indexed directly by slot (0-7), NOT a separately-incremented counter - all
-        //8 slots are always fetched in order, so slot doubles as "how many fetched
-        //so far" without needing a second piece of state that could drift out of
-        //sync (and overflow the 8-element arrays) if this scanline's evaluation
-        //window never ran (e.g. rendering toggled on only partway through 65-320).
         int n = slot;
-        if (n >= nextSpriteCount) nextSpriteCount = n + 1;
-        nextSpriteIsZero[n] = (slot == 0) && (y != 0xFF) && evalSpriteZeroInRange;
+        sprIsZero[n] = (slot == 0) && (y != 0xFF) && evalSpriteZeroInRange;
 
         if (y == 0xFF) {
-            nextSpriteX[n] = 0xFF;
-            nextSpritePlane0[n] = 0;
-            nextSpritePlane1[n] = 0;
-            nextSpriteFlipH[n] = false;
-            nextSpriteBehind[n] = false;
-            nextSpritePaletteGroup[n] = 0;
+            sprCounter[n] = 0xFF;
+            sprShiftLo[n] = 0;
+            sprShiftHi[n] = 0;
+            sprAttrLatch[n] = 0;
             return;
         }
 
@@ -1269,22 +1525,23 @@ public class PPU {
         int patternTableOffset = tall ? (((tileIndex & 0x01) != 0) ? 0x1000 : 0x0000) : spritePatternBase;
         int tileNumber = tall ? (tileIndex & 0xFE) : tileIndex;
 
-        int row = evalTargetScanline - (y + 1);
-        //The sprite's Y comparator keeps running through the fetch phase, against
-        //whatever height PPUCTRL selects *now* - not the height that was in effect
-        //back during evaluation. So a $2000 write at the start of HBlank that drops
-        //8x16 mode leaves an object that evaluation accepted (row 8-15) out of range
-        //by the time its slot is fetched, and the fetch comes back blank rather than
-        //spilling into the next tile's pattern data. See AccuracyCoin "Suddenly
-        //Resize Sprite" test 4 (and test 5, which writes after this slot's own fetch
-        //cycle and so must still see the data).
+        //The fetch-phase comparator uses the PPU's raw 8-bit scanline counter, not
+        //"the scanline evaluation was for" - they agree on visible scanlines but not
+        //pre-render (261 & 255 = 5), so the fetch phase treats pre-render as scanline
+        //5 and can pull pattern data for a stale entry "in range" of line 5. Those
+        //registers survive into scanline 0 - the premise of AccuracyCoin "Sprites On
+        //Scanline 0", whose test object paints only on row 5.
+        int row = (scanline & 0xFF) - y;
+        //The Y comparator keeps running through the fetch phase against whatever
+        //height PPUCTRL selects NOW, not at evaluation time - so a $2000 write during
+        //HBlank that drops 8x16 mode can leave an accepted object out of range by
+        //fetch time, coming back blank instead of spilling into the next tile. See
+        //AccuracyCoin "Suddenly Resize Sprite" tests 4/5.
+        sprCounter[n] = spriteX;
+        sprAttrLatch[n] = attr;
         if (row < 0 || row >= spriteHeight) {
-            nextSpriteX[n] = spriteX;
-            nextSpritePlane0[n] = 0;
-            nextSpritePlane1[n] = 0;
-            nextSpriteFlipH[n] = flipH;
-            nextSpriteBehind[n] = behindBackground;
-            nextSpritePaletteGroup[n] = paletteGroup;
+            sprShiftLo[n] = 0;
+            sprShiftHi[n] = 0;
             return;
         }
         int rowInTile = flipV ? (spriteHeight - 1 - row) : row;
@@ -1297,29 +1554,57 @@ public class PPU {
             tileOffset = patternTableOffset + (tileNumber * 16) + rowInTile;
         }
 
-        nextSpriteX[n] = spriteX;
-        nextSpritePlane0[n] = ppuRead(tileOffset) & 0xFF;
-        nextSpritePlane1[n] = ppuRead(tileOffset + 8) & 0xFF;
-        nextSpriteFlipH[n] = flipH;
-        nextSpriteBehind[n] = behindBackground;
-        nextSpritePaletteGroup[n] = paletteGroup;
+        //Horizontal flip is applied by the loading circuitry, not the output mux: the
+        //shift register is filled in reverse bit order and shifts out of bit 7 as
+        //usual. Doing it here (not at sample time) keeps a partially-drained flipped
+        //shifter correct - it has no "column index" left to mirror.
+        int lo = ppuRead(tileOffset) & 0xFF;
+        int hi = ppuRead(tileOffset + 8) & 0xFF;
+        sprShiftLo[n] = flipH ? reverseByte(lo) : lo;
+        sprShiftHi[n] = flipH ? reverseByte(hi) : hi;
     }
 
-    //Renders one pixel of the current scanline - background then sprites, in real
-    //priority order - and, if this dot is where sprite 0's opaque pixel genuinely
-    //overlaps an opaque background pixel, sets the sprite-0-hit flag right here. Called
-    //once per PPU cycle for cycles 1-256 of each visible scanline (see step()), so the
-    //flag becomes visible to the CPU at the actual x-position of the hit rather than
-    //instantly at the start of the scanline - this is what lets games that time a
-    //mid-frame scroll write off the hit's position (e.g. SMB's status-bar split) work.
+    private static int reverseByte(int b) {
+        int r = 0;
+        for (int i = 0; i < 8; i++) r |= ((b >> i) & 1) << (7 - i);
+        return r;
+    }
+
+    //One dot of the eight sprite output units, run before pixel compositing on every
+    //rendering dot 1-256. A counting unit steps toward its X; a unit reaching zero
+    //latches halted and shifts one pixel out per dot. Since both counter and shifter
+    //only advance while rendering is on, disabling rendering freezes a unit exactly
+    //where it stood, resuming from there when re-enabled.
+    private void clockSpriteUnits(boolean renderingEnabled) {
+        for (int i = 0; i < MAX_ROW_SPRITES; i++) {
+            if (!sprHalted[i]) {
+                if (sprCounter[i] != 0) { sprCounter[i]--; sprPixelOut[i] = 0; continue; }
+                sprHalted[i] = true;
+            }
+            //Counters are free-running through forced blanking, so a sprite whose X is
+            //passed while rendering is briefly off still comes out at that X (test 2).
+            //Shifters are the half that stalls: a unit halted during F-Blank keeps all
+            //8 pixels loaded and dumps them wherever the beam is when rendering
+            //returns (test 3).
+            if (!renderingEnabled) { sprPixelOut[i] = 0; continue; }
+            int b0 = (sprShiftLo[i] >> 7) & 1;
+            int b1 = (sprShiftHi[i] >> 7) & 1;
+            sprPixelOut[i] = (b1 << 1) | b0;
+            sprShiftLo[i] = (sprShiftLo[i] << 1) & 0xFF;
+            sprShiftHi[i] = (sprShiftHi[i] << 1) & 0xFF;
+        }
+    }
+
+    //Renders one pixel - background then sprites, in real priority order - and sets
+    //sprite-0-hit right here if this dot is where sprite 0's opaque pixel genuinely
+    //overlaps opaque background. Called once per dot for cycles 1-256, so the hit
+    //flag becomes visible at the actual x-position (needed for mid-frame scroll
+    //writes timed off the hit, e.g. SMB's status-bar split).
     private void renderPixel(int sy, int x) {
-        //PPUMASK's show/left-mask bits are sampled LIVE, at each dot, not latched once
-        //per scanline. Real hardware has no per-scanline latch for them: a $2001 write
-        //partway across a scanline takes effect on the very next dot. Several
-        //AccuracyCoin tests turn rendering on only a handful of dots before a sprite
-        //zero hit and depend on that hit being evaluated with the just-written mask
-        //("Rendering Flag Behavior" tests 2 and 3 in particular). Latching these at
-        //dot 1 made every such mid-scanline write invisible for the rest of the row.
+        //PPUMASK's show/left-mask bits are sampled live per dot, not latched once per
+        //scanline - a $2001 write mid-scanline takes effect the very next dot.
+        //AccuracyCoin "Rendering Flag Behavior" tests 2/3 depend on a hit being
+        //evaluated with the just-written mask; latching at dot 1 broke this.
         rowShowBackground = (ppumask & 0x08) != 0;
         rowShowSprites = (ppumask & 0x10) != 0;
         rowShowLeftBackground = (ppumask & 0x02) != 0;
@@ -1329,14 +1614,12 @@ public class PPU {
         boolean bgOpaque;
         int debugWinner = -1;
         if (!rowShowBackground || (x < 8 && !rowShowLeftBackground)) {
-            rgb = rowBackdropRgb;
+            rgb = currentPaletteRgb(rowBackdropPaletteIdx);
             bgOpaque = false;
         } else {
-            //Sampled from the real per-dot shift registers (see bgFetchAndShiftStep/
-            //updateBgShifters, run for this exact dot just before renderPixel is
-            //called) rather than a world-space tile-cache lookup - fineX selects which
-            //of the 16 shifted-in bits is "this dot's pixel", the same mux real
-            //hardware wires straight from the shift register outputs.
+            //Sampled from the real per-dot shift registers (updated just before this
+            //call) rather than a world-space tile cache - fineX selects which of the
+            //16 shifted bits is this dot's pixel, same mux real hardware uses.
             int bitMux = 0x8000 >> fineX;
             int bit0 = (bgShiftPatternLo & bitMux) != 0 ? 1 : 0;
             int bit1 = (bgShiftPatternHi & bitMux) != 0 ? 1 : 0;
@@ -1349,72 +1632,49 @@ public class PPU {
             int paletteIndex = (pixelVal == 0)
                     ? (ppuRead(0x3F00) & 0x3F)
                     : (ppuRead(0x3F00 + paletteGroup * 4 + pixelVal) & 0x3F);
-            rgb = NES_PALETTE[paletteIndex];
+            rgb = currentPaletteRgb(paletteIndex);
             bgOpaque = pixelVal != 0;
         }
-        //rowShowSprites must still gate actual sprite drawing/hit-testing even though
-        //evaluation+fetch now always run when rendering is enabled at all (see
-        //startSpriteEvaluation's comment) - the OLD code got this for free because
-        //evaluation itself used to bail out early when sprites were disabled, but
-        //that's exactly the behavior AccuracyCoin's "Rendering Flag Behavior" test 3
-        //and "Sprite Overflow Behavior" test 4 say is wrong (evaluation/overflow must
-        //still happen with only the background enabled) - so the gate has to move
-        //here, to drawing/hit-testing specifically, instead.
-        if (rowShowSprites && rowSpriteCount > 0 && (x >= 8 || rowShowLeftSprites)) {
-            //Real hardware resolves sprite-vs-sprite priority FIRST - the single
-            //topmost (lowest OAM index) sprite with an opaque pixel here wins outright,
-            //full stop - and only THEN decides background-vs-that-one-sprite from its
-            //own priority bit. A lower-priority sprite underneath must never become
-            //visible just because the topmost one lost to the background: that's
-            //exactly the "masking sprite" trick some games rely on (e.g. SMB3 stacks
-            //an opaque, behind-background sprite directly over another sprite's part
-            //that needs hiding - the masking sprite need not itself ever be visible,
-            //its mere presence as the topmost opaque sprite is what blocks the sprite
-            //underneath, letting the opaque background show through instead).
+        //rowShowSprites must still gate drawing/hit-testing even though
+        //evaluation+fetch always run when rendering is enabled - AccuracyCoin
+        //"Rendering Flag Behavior" test 3 and "Sprite Overflow Behavior" test 4 say
+        //evaluation must still happen with only bg enabled, so the gate moves here.
+        if (rowShowSprites && (x >= 8 || rowShowLeftSprites)) {
+            //Real hardware resolves sprite-vs-sprite priority first - the topmost
+            //(lowest index) opaque sprite wins outright - then decides
+            //background-vs-that-sprite from its own priority bit. A lower sprite must
+            //never show through just because the topmost lost to the background -
+            //the "masking sprite" trick some games rely on (e.g. SMB3 stacks an
+            //opaque, behind-background sprite over another sprite's part that needs hiding).
             //
-            //rowSprite* arrays are stored lowest-priority-first (see prepareScanline's
-            //own comment), so n=rowSpriteCount-1 is the topmost (OAM index 0, if
-            //matched, is always last) - iterate highest priority to lowest so the
-            //first opaque hit is the real winner, and stop resolving color after it.
-            //Sprite-0-hit, however, is a separate hardware comparator that fires off
-            //sprite 0's own opacity vs background opacity regardless of whether some
-            //other sprite is drawn on top of it - so that check still runs for every
-            //opaque sprite, not just the topmost.
+            //Unit 0 is highest priority, so a forward scan finds the real winner
+            //first. Sprite-0-hit is a separate comparator wired to unit 0's own shift
+            //register, firing regardless of who wins the pixel.
             boolean topmostResolved = false;
-            for (int n = rowSpriteCount - 1; n >= 0; n--) {
-                int col = x - rowSpriteX[n];
-                if (col < 0 || col > 7) continue;
-
-                int bitIndex = rowSpriteFlipH[n] ? col : (7 - col);
-                int bit0 = (rowSpritePlane0[n] >> bitIndex) & 0x01;
-                int bit1 = (rowSpritePlane1[n] >> bitIndex) & 0x01;
-                int pixelVal = (bit1 << 1) | bit0;
+            for (int n = 0; n < MAX_ROW_SPRITES; n++) {
+                int pixelVal = sprPixelOut[n];
                 if (pixelVal == 0) continue; //transparent
 
-                //Real sprite-0-hit: never fires at x=255 (hardware quirk), and only
-                //against whichever sprite occupies secondary-OAM slot 0 - NOT
-                //necessarily primary OAM index 0. Real hardware's hit comparator is
-                //wired to slot 0's own shift register, so if evaluation started from
-                //a misaligned OAMADDR and some other OAM index happened to land in
-                //slot 0 first, THAT sprite triggers hits instead (AccuracyCoin's
-                //"Arbitrary Sprite Zero" test 2).
-                if (rowSpriteIsZero[n] && bgOpaque && x != 255) {
+                //Real sprite-0-hit never fires at x=255, and only for whichever sprite
+                //occupies secondary-OAM slot 0 - not necessarily primary OAM index 0
+                //(AccuracyCoin "Arbitrary Sprite Zero" test 2).
+                if (sprIsZero[n] && bgOpaque && x != 255) {
                     ppustatus |= 0x40;
                     hitOccurredThisFrame = true;
                     if (DEBUG_SPRITE0) System.out.printf("  [HIT SET] sy=%d x=%d%n", sy, x);
                 }
-                if (DEBUG_SPRITE0 && rowSpriteIsZero[n]) {
+                if (DEBUG_SPRITE0 && sprIsZero[n]) {
                     System.out.printf("sprite0 sy=%d x=%d pixelVal=%d bgHere=%b worldScrollX=%d%n", sy, x, pixelVal, bgOpaque, getWorldScrollX());
                 }
 
-                if (topmostResolved) continue; //already found the real winner above; keep scanning only for sprite-0-hit
+                if (topmostResolved) continue; //already found the real winner; keep scanning only for sprite-0-hit
                 topmostResolved = true;
 
-                if (rowSpriteBehind[n] && bgOpaque) continue; //topmost sprite loses to opaque background - background wins, no lower sprite gets a turn
+                if ((sprAttrLatch[n] & 0x20) != 0 && bgOpaque) continue; //topmost sprite loses to opaque background - no lower sprite gets a turn
 
-                int paletteIndex = ppuRead(0x3F10 + rowSpritePaletteGroup[n] * 4 + pixelVal) & 0x3F;
-                rgb = NES_PALETTE[paletteIndex];
-                debugWinner = rowSpriteIsZero[n] ? 0 : 1; //debug-only marker (0=slot-0/"sprite zero", 1=other); no longer a real OAM index
+                int paletteIndex = ppuRead(0x3F10 + (sprAttrLatch[n] & 0x03) * 4 + pixelVal) & 0x3F;
+                rgb = currentPaletteRgb(paletteIndex);
+                debugWinner = sprIsZero[n] ? 0 : 1; //debug-only marker (0=slot-0, 1=other); not a real OAM index
             }
         }
 
@@ -1424,11 +1684,9 @@ public class PPU {
         if (display != null) display.setPixel(x, sy, rgb);
     }
 
-    //Debug-only: reports exactly what actually rendered at a given screen pixel -
-    //read from debugBgOpaque/debugWinnerOam, which renderPixel() records live as it
-    //genuinely renders each dot (see those fields' comment for why re-deriving this
-    //after the fact, from a paused frame's final register state, isn't trustworthy
-    //for an MMC3 game that swaps CHR banks mid-frame).
+    //Debug-only: reports what actually rendered at a pixel, from debugBgOpaque/
+    //debugWinnerOam recorded live by renderPixel() (see those fields' comment for why
+    //re-deriving this after the fact isn't trustworthy for MMC3 CHR-bank swaps).
     public String explainPixel(int x, int sy) {
         int idx = sy * 256 + x;
         boolean bgOpaque = debugBgOpaque[idx];
@@ -1438,12 +1696,9 @@ public class PPU {
                 winner < 0 ? "background" : ("OAM[" + winner + "]"));
     }
 
-    //Debug-only: renders a small rectangular region as an ASCII grid, one character
-    //per pixel, from the same live-recorded per-pixel data explainPixel() uses -
-    //so the actual shape of what won each pixel can be seen at a glance. '.' =
-    //transparent background won (backdrop showing), '#' = opaque background tile
-    //won, and a hex digit = the low nibble of the OAM index of the sprite that won
-    //that pixel (matching digits trace out one sprite's visible shape).
+    //Debug-only: renders a small region as an ASCII grid from the same live-recorded
+    //per-pixel data explainPixel() uses. '.' = transparent bg, '#' = opaque bg, hex
+    //digit = low nibble of winning OAM index (matching digits trace one sprite's shape).
     public String explainGrid(int x0, int y0, int w, int h) {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("grid x=%d..%d y=%d..%d ('.'=transparent bg, '#'=opaque bg, hex digit=winning OAM index low nibble):%n", x0, x0 + w - 1, y0, y0 + h - 1));

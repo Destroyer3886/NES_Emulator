@@ -11,8 +11,11 @@ import java.awt.event.KeyEvent;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 public class NESEmulator extends JFrame implements Runnable {
 
@@ -22,14 +25,14 @@ public class NESEmulator extends JFrame implements Runnable {
     private volatile boolean running = false;
     private volatile boolean paused = false;
 
-    //Emulator Components
+    //Emulator components
     private final CPU cpu;
     private final PPU ppu;
     private final APU apu;
     private final Bus bus;
     private final AudioPlayer audioPlayer;
 
-    //Debug Trace Window Components
+    //Debug trace window components
     private JDialog traceDialog;
     private JTextArea traceTextArea;
     private JButton traceToggleButton;
@@ -37,80 +40,53 @@ public class NESEmulator extends JFrame implements Runnable {
     private JToggleButton tracePauseButton;
     private volatile boolean tracingEnabled = false;
     private final StringBuilder frameTraceBuffer = new StringBuilder();
-    //When tracing is toggled on, every frame's trace lines are also appended here so a
-    //multi-frame window (e.g. an entire AccuracyCoin test) can be captured to disk -
-    //the on-screen trace text area only ever shows the most recent frame.
+    //Accumulates every frame's trace lines while tracing is on, for multi-frame capture to disk.
     private java.io.PrintWriter traceFileWriter;
-    //Independent of the above - lets the trace be saved to a fixed, easy-to-find
-    //location (the user's Desktop) without needing to be co-located with the
-    //working directory that trace_log.txt is written to.
+    //Separate from traceFileWriter: always saves to the Desktop regardless of working dir.
     private JToggleButton logToFileButton;
     private java.io.PrintWriter desktopLogWriter;
 
-    //Memory Inspector Window Components
+    //Memory inspector window components
     private JDialog memoryDialog;
     private JTable memoryTable;
     private MemoryTableModel memoryTableModel;
     private JTextField memoryGotoField;
-    //Cache of the last value shown for each address, so refreshes only touch the
-    //table cells that actually changed instead of resetting the whole document -
-    //that's what keeps the view from flickering or losing scroll position.
+    //Last-shown value per address, so refreshes only touch changed cells (no flicker/scroll reset).
     private final int[] memorySnapshot = new int[65536];
 
     //Debug viewer windows
     private NametableViewerDialog nametableViewerDialog;
     private PPUInspectorDialog ppuInspectorDialog;
 
-    //TAS Maker Window Components
+    //TAS Maker window components
     private JDialog tasDialog;
     private JTable tasTable;
     private TasTableModel tasTableModel;
     private JToggleButton tasPlayButton;
-    //While the TAS Maker is open, it owns controller 1 entirely (recorded/edited
-    //input replaces whatever the keyboard is doing) and it owns frame advancement -
-    //the normal real-time loop in run() must not also be stepping frames.
+    //While TAS Maker is open it owns controller 1 and frame advancement; run()'s loop must not also step.
     private volatile boolean tasActive = false;
     private boolean tasPlaying = false;
     private javax.swing.Timer tasPlayTimer;
-    //Recorded (or edited) per-frame controller 1 bitmask, one entry per frame, in
-    //the same LSB-first A/B/Select/Start/Up/Down/Left/Right bit order keyToBit uses.
-    //Index i is the row where the button was pressed, but - matching real controller
-    //latency - it isn't read by the game until frame i+1: frame k's controller poll
-    //sees tasInputs.get(k - 1) (frame 0 sees nothing, since there's no row -1). This
-    //IS the movie - the emulator has no other notion of a "savestate": seeking to any
-    //frame means replaying this list from power-on.
+    //Recorded/edited per-frame controller 1 bitmask (LSB-first A/B/Select/Start/Up/Down/Left/Right).
+    //Frame k's poll reads tasInputs.get(k-1) (one-frame latency; frame 0 sees nothing). This is the
+    //movie - there's no other savestate notion, seeking replays this list from power-on.
     private final List<Integer> tasInputs = new ArrayList<>();
-    //Number of frames already executed against the live cpu/ppu/apu/bus - i.e. the
-    //table row currently shown on screen is tasFrame - 1. The *next* frame Play (or
-    //a forward seek) will run reads tasInputs.get(tasFrame - 1).
+    //Frames already executed against the live state; shown row is tasFrame - 1.
     private int tasFrame = 0;
-    //How many frames (from frame 0) currently have a valid, up-to-date "savestate" -
-    //i.e. have actually been replayed against the CURRENT contents of tasInputs.
-    //Frame row < tasValidFrontier is colored green/red (see TasRowColoring); rows at
-    //or past it haven't been (re-)computed yet and get the plain default look. Seeking
-    //(forward or backward) never shrinks this - only editing an input does, since that's
-    //the only thing that actually invalidates any previously-computed state.
+    //How many frames (from 0) have an up-to-date "savestate" matching current tasInputs.
+    //Rows below this are colored green/red (see tasRowColor); rows at/after are plain.
+    //Only editing an input shrinks this - seeking never does.
     private int tasValidFrontier = 0;
-    //Parallel to tasInputs: whether controller 1 was strobed (read) during that
-    //frame, captured off Bus.consumeStrobedThisFrame() right after the frame that
-    //produced it runs. A validated frame with no strobe is a "lag frame" - the game
-    //never polled input that frame - which is what the red/green coloring surfaces.
+    //Parallel to tasInputs: whether controller 1 was strobed that frame (see Bus.consumeStrobedThisFrame).
+    //Validated+unstrobed = "lag frame", surfaced by the red/green coloring.
     private final List<Boolean> tasFrameStrobed = new ArrayList<>();
-    //Greenzone checkpoints: full emulator snapshots keyed by "executed frame count"
-    //(the same units as tasFrame/tasValidFrontier - a key of K means "state right
-    //after frames 0..K-1 have executed"), captured on a fixed grid anchored at frame
-    //0 (keys 0, N, 2N, ... where N is tasSavestateInterval) so seekToFrame can
-    //restore the nearest one at/below a target instead of always replaying from
-    //power-on. TreeMap so seekToFrame can cheaply find the largest key <= target via
-    //floorKey. Frame 0 itself never needs an entry - bus.hardReset() already gives
-    //that state for free. See maybeCaptureTasCheckpoint() for how/when entries are
-    //added, and invalidateTasCheckpointsFrom() for how edits/inserts drop stale ones.
+    //Greenzone checkpoints: full emulator snapshots keyed by executed frame count, on a fixed grid
+    //(0, N, 2N, ... where N = tasSavestateInterval) so seekToFrame can restore the nearest one instead
+    //of always replaying from power-on. TreeMap for cheap floorKey lookups. Frame 0 needs no entry -
+    //bus.hardReset() covers it. See maybeCaptureTasCheckpoint / invalidateTasCheckpointsFrom.
     private final TreeMap<Integer, TasCheckpoint> tasCheckpoints = new TreeMap<>();
-    //Pairs a machine-state checkpoint with the display pixels that were on screen at
-    //that instant - Bus.EmulatorState covers CPU/PPU/APU/Bus/cartridge, but the
-    //visible framebuffer lives in NESDisplayPanel, not the PPU, so it has to be
-    //captured/restored separately or an exact-checkpoint seek (no replay needed)
-    //would leave the old frame on screen.
+    //Pairs a state checkpoint with the on-screen pixels at that instant - the framebuffer lives in
+    //NESDisplayPanel, not the PPU, so it must be captured/restored alongside the state.
     private static final class TasCheckpoint {
         final Bus.EmulatorState state;
         final int[] pixels;
@@ -119,22 +95,16 @@ public class NESEmulator extends JFrame implements Runnable {
             this.pixels = pixels;
         }
     }
-    //"Frames per savestate" setting - see createTasSettingsDialog(). Every frame
-    //count that's a multiple of this becomes a checkpoint grid point. 1 means every
-    //single frame gets a checkpoint (fastest scrubbing, most memory); higher values
-    //trade memory for a longer worst-case replay-to-target after a backward seek.
+    //"Frames per savestate" (see createTasSettingsDialog). 1 = checkpoint every frame
+    //(fastest scrubbing, most memory); higher trades memory for longer backward-seek replay.
     private int tasSavestateInterval = 1;
     private JDialog tasSettingsDialog;
 
-    //Frame index -> marker name ("" for an unlabeled marker). Markers paint their
-    //row yellow (see tasRowColor) and let the user fast-travel via the Markers
-    //dialog (openMarkersDialog) or jump the selection boundary via "Select Between
-    //Markers" (selectBetweenMarkers).
+    //Frame index -> marker name ("" if unlabeled). Rows paint yellow (tasRowColor);
+    //fast-travel via Markers dialog or "Select Between Markers".
     private final TreeMap<Integer, String> tasMarkers = new TreeMap<>();
     private JDialog tasMarkersDialog;
-    //Copy/paste clipboard for the frame timeline: a snapshot of controller bitmasks
-    //(not a live view of tasInputs), populated by copySelectedFrames and consumed by
-    //pasteFrames.
+    //Copy/paste clipboard for the frame timeline: a snapshot of controller bitmasks, not a live view.
     private List<Integer> tasClipboard = null;
     private JPopupMenu tasContextMenu;
 
@@ -143,7 +113,11 @@ public class NESEmulator extends JFrame implements Runnable {
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setResizable(false);
 
-        //Initialize Hardware
+        //Set once here - AWT walks the owner chain, so every owned JDialog inherits this icon.
+        ImageIcon appIcon = new ImageIcon("res/logo.png");
+        if (appIcon.getIconWidth() > 0) setIconImage(appIcon.getImage());
+
+        //Initialize hardware
         ppu = new PPU();
         apu = new APU();
         bus = new Bus(ppu, apu);
@@ -173,57 +147,168 @@ public class NESEmulator extends JFrame implements Runnable {
         createTraceWindow();
         createMemoryInspector();
         createTASMakerWindow();
+        createControllerSetupDialog();
         setupController();
     }
 
-    //Player 1 mapping: Enter=Start, Z=B, X=Up(D-pad), Space=Select, Up arrow=A,
-    //Left/Down/Right arrows=D-pad Left/Down/Right.
     //Bit order matches Bus's shift-out order (LSB first): A,B,Select,Start,Up,Down,Left,Right.
     private volatile int controller1Bits = 0;
 
-    //While paused, a tap (press+release before the next Step) latches its bit here
-    //instead of dropping it, so the queued button still reads as held for the one
-    //frame that Step runs - letting you line up an input with the trace logger
-    //without having to hold the key down for the whole real-time pause.
+    //While paused, a tap (press+release before Step) latches here instead of dropping,
+    //so it still reads as held for the one frame Step runs.
     private volatile int queuedInputBits = 0;
 
+    //Controller setup window components
+    private static final String[] BUTTON_NAMES = {"A", "B", "Select", "Start", "Up", "Down", "Left", "Right"};
+    private static final int[] BUTTON_BITS = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    private static final int[] DEFAULT_KEYS = {
+            KeyEvent.VK_UP, KeyEvent.VK_Z, KeyEvent.VK_SPACE, KeyEvent.VK_ENTER,
+            KeyEvent.VK_X, KeyEvent.VK_DOWN, KeyEvent.VK_LEFT, KeyEvent.VK_RIGHT
+    };
+    private final Map<String, Integer> keyBindings = new LinkedHashMap<>();
+    private final Map<String, JButton> keybindButtons = new LinkedHashMap<>();
+    private JDialog controllerDialog;
+    private JCheckBox allowDpadConflictsCheckbox;
+    //When false (default), only the most recently pressed key of each opposing D-pad
+    //pair takes effect (real controllers can't hold both); see udPressOrder/lrPressOrder.
+    private boolean allowDpadConflicts = false;
+
+    //Physical keys currently held, independent of binding - handles rebind-mid-hold and autorepeat.
+    private final Set<Integer> rawKeysHeld = new HashSet<>();
+    //Press-order of held keys bound to Up/Down and Left/Right. Only the most recent entry
+    //of each is "active" when D-pad conflicts are disallowed.
+    private final List<Integer> udPressOrder = new ArrayList<>();
+    private final List<Integer> lrPressOrder = new ArrayList<>();
+
     private void setupController() {
+        for (int i = 0; i < BUTTON_NAMES.length; i++) keyBindings.put(BUTTON_NAMES[i], DEFAULT_KEYS[i]);
+
         displayPanel.setFocusable(true);
         displayPanel.requestFocusInWindow();
         displayPanel.addKeyListener(new KeyAdapter() {
             @Override public void keyPressed(KeyEvent e) {
-                int bit = keyToBit(e.getKeyCode());
-                controller1Bits |= bit;
-                if (paused) queuedInputBits |= bit;
-                if (!tasActive) bus.setController1(controller1Bits | queuedInputBits);
+                String button = buttonForKey(e.getKeyCode());
+                if (button == null) return;
+                if (rawKeysHeld.add(e.getKeyCode())) {
+                    if (button.equals("Up") || button.equals("Down")) {
+                        udPressOrder.remove(Integer.valueOf(e.getKeyCode()));
+                        udPressOrder.add(e.getKeyCode());
+                    } else if (button.equals("Left") || button.equals("Right")) {
+                        lrPressOrder.remove(Integer.valueOf(e.getKeyCode()));
+                        lrPressOrder.add(e.getKeyCode());
+                    }
+                }
+                recomputeControllerBits();
             }
             @Override public void keyReleased(KeyEvent e) {
-                controller1Bits &= ~keyToBit(e.getKeyCode());
-                if (!tasActive) bus.setController1(controller1Bits | queuedInputBits);
+                rawKeysHeld.remove(e.getKeyCode());
+                udPressOrder.remove(Integer.valueOf(e.getKeyCode()));
+                lrPressOrder.remove(Integer.valueOf(e.getKeyCode()));
+                recomputeControllerBits();
             }
         });
     }
 
-    private int keyToBit(int keyCode) {
-        switch (keyCode) {
-            case KeyEvent.VK_UP: return 0x01;     //A
-            case KeyEvent.VK_Z: return 0x02;      //B
-            case KeyEvent.VK_SPACE: return 0x04;  //Select
-            case KeyEvent.VK_ENTER: return 0x08;  //Start
-            case KeyEvent.VK_X: return 0x10;      //D-pad Up
-            case KeyEvent.VK_DOWN: return 0x20;   //D-pad Down
-            case KeyEvent.VK_LEFT: return 0x40;   //D-pad Left
-            case KeyEvent.VK_RIGHT: return 0x80;  //D-pad Right
-            default: return 0x00;
+    private String buttonForKey(int keyCode) {
+        for (Map.Entry<String, Integer> entry : keyBindings.entrySet()) {
+            if (entry.getValue() == keyCode) return entry.getKey();
+        }
+        return null;
+    }
+
+    private int bitForButton(String name) {
+        for (int i = 0; i < BUTTON_NAMES.length; i++) if (BUTTON_NAMES[i].equals(name)) return BUTTON_BITS[i];
+        return 0;
+    }
+
+    //Recomputes controller1Bits from held keys, applying the D-pad conflict mask unless disabled.
+    private void recomputeControllerBits() {
+        int newBits = 0;
+        for (String name : new String[]{"A", "B", "Select", "Start"}) {
+            if (rawKeysHeld.contains(keyBindings.get(name))) newBits |= bitForButton(name);
+        }
+        if (allowDpadConflicts) {
+            for (String name : new String[]{"Up", "Down", "Left", "Right"}) {
+                if (rawKeysHeld.contains(keyBindings.get(name))) newBits |= bitForButton(name);
+            }
+        } else {
+            if (!udPressOrder.isEmpty()) newBits |= bitForButton(buttonForKey(udPressOrder.get(udPressOrder.size() - 1)));
+            if (!lrPressOrder.isEmpty()) newBits |= bitForButton(buttonForKey(lrPressOrder.get(lrPressOrder.size() - 1)));
+        }
+
+        int prevBits = controller1Bits;
+        controller1Bits = newBits;
+        int pressedNew = newBits & ~prevBits;
+        if (paused) queuedInputBits |= pressedNew;
+        if (!tasActive) bus.setController1(controller1Bits | queuedInputBits);
+    }
+
+    private void createControllerSetupDialog() {
+        controllerDialog = new JDialog(this, "Controller Setup", false);
+        controllerDialog.setLayout(new BorderLayout());
+
+        JPanel gridPanel = new JPanel(new GridLayout(BUTTON_NAMES.length, 2, 8, 6));
+        gridPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        for (String name : BUTTON_NAMES) {
+            gridPanel.add(new JLabel(name, SwingConstants.RIGHT));
+            JButton bindButton = new JButton(KeyEvent.getKeyText(DEFAULT_KEYS[indexOfButton(name)]));
+            bindButton.addActionListener(e -> startKeyCapture(name, bindButton));
+            keybindButtons.put(name, bindButton);
+            gridPanel.add(bindButton);
+        }
+
+        allowDpadConflictsCheckbox = new JCheckBox("Allow D-Pad Conflicts", false);
+        allowDpadConflictsCheckbox.addActionListener(e -> allowDpadConflicts = allowDpadConflictsCheckbox.isSelected());
+
+        JButton restoreDefaultsButton = new JButton("Restore Defaults");
+        restoreDefaultsButton.addActionListener(e -> restoreDefaultKeybinds());
+
+        JPanel bottomPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        bottomPanel.add(allowDpadConflictsCheckbox);
+        bottomPanel.add(restoreDefaultsButton);
+
+        controllerDialog.add(gridPanel, BorderLayout.CENTER);
+        controllerDialog.add(bottomPanel, BorderLayout.SOUTH);
+        controllerDialog.pack();
+        controllerDialog.setLocationRelativeTo(this);
+    }
+
+    private int indexOfButton(String name) {
+        for (int i = 0; i < BUTTON_NAMES.length; i++) if (BUTTON_NAMES[i].equals(name)) return i;
+        return -1;
+    }
+
+    //Enters "listening" mode and installs a one-shot global dispatcher to capture the next key,
+    //so binding works regardless of dialog focus.
+    private void startKeyCapture(String buttonName, JButton bindButton) {
+        String previousText = bindButton.getText();
+        bindButton.setText("Press any key...");
+        KeyboardFocusManager focusManager = KeyboardFocusManager.getCurrentKeyboardFocusManager();
+        KeyEventDispatcher[] dispatcherHolder = new KeyEventDispatcher[1];
+        dispatcherHolder[0] = e -> {
+            if (e.getID() != KeyEvent.KEY_PRESSED) return false;
+            if (e.getKeyCode() != KeyEvent.VK_ESCAPE) {
+                keyBindings.put(buttonName, e.getKeyCode());
+                bindButton.setText(KeyEvent.getKeyText(e.getKeyCode()));
+            } else {
+                bindButton.setText(previousText);
+            }
+            focusManager.removeKeyEventDispatcher(dispatcherHolder[0]);
+            return true;
+        };
+        focusManager.addKeyEventDispatcher(dispatcherHolder[0]);
+    }
+
+    private void restoreDefaultKeybinds() {
+        for (int i = 0; i < BUTTON_NAMES.length; i++) {
+            keyBindings.put(BUTTON_NAMES[i], DEFAULT_KEYS[i]);
+            keybindButtons.get(BUTTON_NAMES[i]).setText(KeyEvent.getKeyText(DEFAULT_KEYS[i]));
         }
     }
 
-    //Backs the memory inspector table: one independently-addressable cell per byte
-    //($0000-$FFFF, 16 bytes/row) plus an address column and an ASCII column. Values
-    //are read live from the bus on every paint, so no snapshot of memory is held here -
-    //only fireTableCellUpdated() needs to be called (from scanMemoryForChanges) to make
-    //a specific cell repaint, which is what lets the view update in place without
-    //flickering or disturbing the current scroll position.
+    //Backs the memory inspector table: $0000-$FFFF, 16 bytes/row, plus address/ASCII columns.
+    //Reads live from the bus each paint - no local snapshot; scanMemoryForChanges triggers
+    //targeted fireTableCellUpdated() calls to avoid flicker/scroll reset.
     private class MemoryTableModel extends AbstractTableModel {
         static final int ROWS = 4096;
         static final int COLS = 18; //address + 16 bytes + ascii
@@ -255,15 +340,30 @@ public class NESEmulator extends JFrame implements Runnable {
 
     }
 
+    private static final Color FROZEN_CELL_COLOR = new Color(0xADD8E6); //light blue
+
+    //Colors a memory inspector cell light blue when its RAM address is frozen.
+    private class FrozenAwareCellRenderer extends DefaultTableCellRenderer {
+        FrozenAwareCellRenderer(int alignment) { setHorizontalAlignment(alignment); }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
+                                                         boolean hasFocus, int row, int column) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            int address = row * 16 + (column - 1);
+            if (!isSelected) {
+                c.setBackground(bus.isRamAddressFrozen(address) ? FROZEN_CELL_COLOR : Color.WHITE);
+            }
+            return c;
+        }
+    }
+
     //Column order/letters: A, B, select, start, Up, Down, Left, Right.
     private static final int[] TAS_BUTTON_BITS = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
     private static final String[] TAS_BUTTON_NAMES = {"A", "B", "s", "S", "U", "D", "L", "R"};
 
-    //Backs the TAS Maker's frame timeline: one row per recorded frame, one checkbox
-    //column per controller button. tasInputs (the movie itself) is the only backing
-    //store - this model just reads/writes it, and editFrameInput handles the
-    //"clear everything after an edited frame" invalidation described on NESEmulator's
-    //tasInputs field.
+    //Backs the TAS Maker's frame timeline; tasInputs is the sole backing store, this
+    //model just reads/writes it (editFrameInput handles invalidation).
     private class TasTableModel extends AbstractTableModel {
         @Override public int getRowCount() { return tasInputs.size(); }
         @Override public int getColumnCount() { return 1 + TAS_BUTTON_BITS.length; }
@@ -278,11 +378,8 @@ public class NESEmulator extends JFrame implements Runnable {
             return col == 0 ? Integer.class : Boolean.class;
         }
 
-        //Button cells are never edited through JTable's own click/edit machinery -
-        //toggling and press-and-hold painting are handled entirely by the mouse
-        //listeners set up in createTASMakerWindow, which call editFrameInput directly.
-        //Editability is off here so a click doesn't ALSO kick off cell editing on top
-        //of that (which was double-toggling the value right back to what it started).
+        //Button cells are toggled via the mouse listeners in createTASMakerWindow, not JTable's
+        //own edit machinery - editability off here prevents a double-toggle.
         @Override
         public boolean isCellEditable(int row, int col) {
             return false;
@@ -306,12 +403,8 @@ public class NESEmulator extends JFrame implements Runnable {
     private static final Color TAS_UNEMULATED_COLOR = Color.WHITE;             //past tasValidFrontier: no savestate yet
     private static final Color TAS_MARKER_COLOR = Color.YELLOW;                //marked frame - takes priority over validity coloring
 
-    //Shared by both TAS table cell renderers: a marked frame is always yellow
-    //regardless of validity. Otherwise a row past tasValidFrontier has never been
-    //(re-)emulated against the movie's current contents, so it gets the plain
-    //default look; otherwise it's colored by whether that frame's playthrough ever
-    //strobed the controller (see tasFrameStrobed/Bus.consumeStrobedThisFrame) - an
-    //emulated-but-unstrobed frame is a "lag frame" the game didn't act on.
+    //Shared by both TAS table renderers: marked frame is always yellow; unemulated rows
+    //(>= tasValidFrontier) are plain; otherwise colored by whether the frame strobed the controller.
     private Color tasRowColor(int row) {
         if (tasMarkers.containsKey(row)) return TAS_MARKER_COLOR;
         if (row >= tasValidFrontier) return TAS_UNEMULATED_COLOR;
@@ -329,9 +422,7 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Draws one grid cell of the button timeline: a plain colored box that shows the
-    //column's letter (U/D/L/R/S/s/B/A, per res/Example.png) when that button is
-    //pressed on that frame, and nothing when it isn't - instead of a checkbox.
+    //One grid cell of the button timeline: colored box showing the button letter when pressed.
     private class TasButtonBox extends JComponent {
         private boolean pressed = false;
         private String letter = "";
@@ -392,8 +483,7 @@ public class NESEmulator extends JFrame implements Runnable {
         memoryTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
         memoryTable.setCellSelectionEnabled(true);
 
-        DefaultTableCellRenderer centered = new DefaultTableCellRenderer();
-        centered.setHorizontalAlignment(SwingConstants.CENTER);
+        DefaultTableCellRenderer centered = new FrozenAwareCellRenderer(SwingConstants.CENTER);
         for (int col = 0; col < MemoryTableModel.COLS; col++) {
             TableColumn column = memoryTable.getColumnModel().getColumn(col);
             if (col == 0) {
@@ -409,8 +499,67 @@ public class NESEmulator extends JFrame implements Runnable {
 
         Arrays.fill(memorySnapshot, -1);
 
+        installMemoryContextMenu();
+
         memoryDialog.add(topPanel, BorderLayout.NORTH);
         memoryDialog.add(new JScrollPane(memoryTable), BorderLayout.CENTER);
+    }
+
+    //Right-click on a byte cell (columns 1-16) opens an Override/Freeze menu for that address.
+    private void installMemoryContextMenu() {
+        memoryTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mousePressed(java.awt.event.MouseEvent e) { maybeShowPopup(e); }
+            @Override public void mouseReleased(java.awt.event.MouseEvent e) { maybeShowPopup(e); }
+
+            private void maybeShowPopup(java.awt.event.MouseEvent e) {
+                if (!e.isPopupTrigger()) return;
+                int row = memoryTable.rowAtPoint(e.getPoint());
+                int col = memoryTable.columnAtPoint(e.getPoint());
+                if (row < 0 || col < 1 || col > 16) return;
+                int address = row * 16 + (col - 1);
+                if (address > 0x1FFF) return; //only RAM supports Override/Freeze
+                memoryTable.setRowSelectionInterval(row, row);
+                memoryTable.setColumnSelectionInterval(col, col);
+                showMemoryContextMenu(address, e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    private void showMemoryContextMenu(int address, Component invoker, int x, int y) {
+        JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem overrideItem = new JMenuItem("Override...");
+        overrideItem.addActionListener(e -> overrideMemoryAddress(address));
+        menu.add(overrideItem);
+
+        boolean frozen = bus.isRamAddressFrozen(address);
+        JMenuItem freezeItem = new JMenuItem(frozen ? "Unfreeze" : "Freeze");
+        freezeItem.addActionListener(e -> {
+            if (bus.isRamAddressFrozen(address)) {
+                bus.unfreezeRamAddress(address);
+            } else {
+                bus.freezeRamAddress(address, bus.debugRead(address));
+            }
+            memorySnapshot[address] = -1; //force repaint next scan
+        });
+        menu.add(freezeItem);
+
+        menu.show(invoker, x, y);
+    }
+
+    private void overrideMemoryAddress(int address) {
+        String current = String.format("%02X", bus.debugRead(address) & 0xFF);
+        String input = JOptionPane.showInputDialog(memoryDialog,
+                String.format("Enter a hex byte value for $%04X:", address), current);
+        if (input == null) return;
+        try {
+            int value = Integer.parseInt(input.trim().replace("$", "").replace("0x", ""), 16);
+            if (value < 0 || value > 0xFF) throw new NumberFormatException();
+            bus.overrideRamAddress(address, (byte) value);
+            memorySnapshot[address] = -1;
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(memoryDialog, "Enter a valid hex byte (00-FF)", "Invalid Value", JOptionPane.WARNING_MESSAGE);
+        }
     }
 
     private void createTASMakerWindow() {
@@ -449,22 +598,10 @@ public class NESEmulator extends JFrame implements Runnable {
         topPanel.add(settingsButton);
 
         tasTableModel = new TasTableModel();
-        //Overriding changeSelection to ignore anything outside column 0 is what keeps
-        //a click/drag on a button cell from ALSO moving the seek playhead - only the
-        //Frame# column drives that now; button cells are purely painted (see the
-        //mouse listeners below), never selected. tasFrameColumnDragging is the
-        //exception: once a drag STARTS on the Frame# column, it keeps scrubbing even
-        //if the mouse's X strays off that column (over the buttons, or out of the
-        //table entirely) as long as the button stays held - matching how dragging
-        //normally behaves in other apps once you've grabbed a handle.
-        //JTable's own mouse handling (BasicTableUI) only ever drives changeSelection
-        //for the LEFT button - a right-button press/drag never reaches it at all, so
-        //this path is exclusively the left-click/left-drag "follow the cursor" scrub
-        //behavior. Forcing extend=false here (regardless of what JTable computed) is
-        //what keeps a left-drag from turning into a multi-row range selection - it
-        //always just moves the single-row selection (and playhead) to match the
-        //cursor. Right-drag range-highlighting is handled separately, directly
-        //against the selection model, in the mouse listener below.
+        //Only the Frame# column drives selection/playhead; button cells are painted, never selected
+        //(see mouse listeners below). tasFrameColumnDragging lets a drag begun on Frame# keep
+        //scrubbing even if the cursor strays off-column. This only ever sees left-button drags
+        //(JTable routes right-button separately); forcing extend=false keeps it single-row.
         tasTable = new JTable(tasTableModel) {
             @Override
             public void changeSelection(int rowIndex, int columnIndex, boolean toggle, boolean extend) {
@@ -479,16 +616,10 @@ public class NESEmulator extends JFrame implements Runnable {
         for (int i = 1; i <= TAS_BUTTON_BITS.length; i++) {
             tasTable.getColumnModel().getColumn(i).setPreferredWidth(50);
         }
-        //Left click/drag on the Frame# column scrubs the playhead one row at a time
-        //(see changeSelection above), always ending on a single-row selection. Right
-        //click+drag instead range-selects (blue highlight) for clipboard/marker/
-        //add-inputs operations, without moving the playhead - so the playhead only
-        //follows when the selection resolves to exactly one row.
+        //Left drag on Frame# scrubs the playhead; right drag range-selects without moving it.
         tasTable.getSelectionModel().setSelectionMode(javax.swing.ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
-        //Deliberately does NOT skip e.getValueIsAdjusting() events - a left-drag scrub
-        //needs to seek on every intermediate row the cursor passes over, not just once
-        //on release. Right-drag range-selection never reaches this at all (it's done
-        //with suppressTasSelectionEvents held true), so it's never mistaken for a scrub.
+        //Doesn't skip isAdjusting events - a left-drag scrub must seek on every intermediate row.
+        //Right-drag range-selection uses suppressTasSelectionEvents so it never reaches here.
         tasTable.getSelectionModel().addListSelectionListener(e -> {
             if (tasPlaying || suppressTasSelectionEvents) return;
             int[] rows = tasTable.getSelectedRows();
@@ -501,9 +632,7 @@ public class NESEmulator extends JFrame implements Runnable {
             @Override public void mouseReleased(java.awt.event.MouseEvent e) { maybeShowTasContextMenu(e); }
         });
 
-        //Tracks whether the current drag started on the Frame# column, so
-        //changeSelection above knows to keep following it even once the mouse's X
-        //strays off that column.
+        //Tracks whether the current drag started on the Frame# column (see changeSelection above).
         tasTable.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mousePressed(java.awt.event.MouseEvent e) {
                 tasFrameColumnDragging = javax.swing.SwingUtilities.isLeftMouseButton(e)
@@ -515,12 +644,8 @@ public class NESEmulator extends JFrame implements Runnable {
             }
         });
 
-        //Right click+drag range-selects (blue highlight) instead of scrubbing -
-        //handled directly against the selection model since JTable's own mouse
-        //handling (and therefore changeSelection above) never sees right-button
-        //events at all. A right press that never turns into a drag just leaves the
-        //single row under the cursor selected, so a plain right-click still acts on
-        //one frame via the context menu (see maybeShowTasContextMenu).
+        //Right click+drag range-selects instead of scrubbing, handled directly against the
+        //selection model since JTable's own handling never sees right-button events.
         tasTable.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mousePressed(java.awt.event.MouseEvent e) {
                 if (!javax.swing.SwingUtilities.isRightMouseButton(e)) return;
@@ -558,11 +683,8 @@ public class NESEmulator extends JFrame implements Runnable {
             }
         });
 
-        //Press-and-hold "painting" of a button across many frames at once, like
-        //FCEUX/BizHawk: pressing on a button cell toggles it and remembers that as
-        //the paint value, then dragging up/down through other rows (still in that
-        //same column) stamps every row the mouse passes over to that same value,
-        //instead of needing one click per frame.
+        //Press-and-hold "painting" (FCEUX/BizHawk-style): press toggles a cell and sets the
+        //paint value, dragging stamps that value onto every row passed over in that column.
         tasTable.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mousePressed(java.awt.event.MouseEvent e) {
                 if (!javax.swing.SwingUtilities.isLeftMouseButton(e)) return;
@@ -594,15 +716,8 @@ public class NESEmulator extends JFrame implements Runnable {
         });
 
         JScrollPane tasScrollPane = new JScrollPane(tasTable);
-        //Lets scrubbing (or button painting) continue via the scroll wheel while the
-        //mouse is held down (instead of only on drag) - normally the wheel just
-        //scrolls the view and the playhead only follows once you move the mouse
-        //again, which meant alternating "scroll a bit, nudge the mouse, scroll a bit"
-        //to cover any real distance. This lets the held-down mouse keep following (or
-        //painting) the row that ends up under it after each scroll tick - but ONLY
-        //for whichever gesture was actually started: a drag that began on the Frame#
-        //column keeps seeking, a drag that began on a button cell keeps painting that
-        //column. Scrolling with the button held elsewhere (or not held at all) does neither.
+        //Lets scrubbing/painting continue via the scroll wheel while the mouse is held down,
+        //instead of only on drag movement. Only applies to whichever gesture was already active.
         tasScrollPane.addMouseWheelListener(e -> {
             if (tasPlaying) return;
             if (!tasFrameColumnDragging && tasPaintColumn == null) return;
@@ -629,12 +744,8 @@ public class NESEmulator extends JFrame implements Runnable {
         tasPlayTimer = new javax.swing.Timer(1000 / 60, e -> tasAdvanceOneFrame());
     }
 
-    //Extensible TAS Maker settings dialog: each setting is one row added via
-    //addIntSetting (or a similar helper for future setting types) onto a simple
-    //vertical GridBagLayout list, so adding another setting later is just another
-    //call here rather than a bespoke layout. Built lazily/once and just re-shown -
-    //its controls always reflect live field values since there's nothing else that
-    //can change tasSavestateInterval out from under it.
+    //Extensible settings dialog: each setting is one row via addIntSetting on a vertical
+    //GridBagLayout list. Built lazily once and re-shown.
     private void createTasSettingsDialog() {
         tasSettingsDialog = new JDialog(tasDialog, "TAS Maker Settings", false);
         tasSettingsDialog.setLayout(new BorderLayout());
@@ -663,10 +774,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasSettingsDialog.setLocationRelativeTo(tasDialog);
     }
 
-    //Adds one "label + spinner" settings row bound to an arbitrary int field via a
-    //getter/setter pair, advancing gbc.gridy for the next row. The spinner commits on
-    //every change (no separate OK/Apply step) since TAS Maker settings are cheap,
-    //reversible knobs, not something that needs a confirm step.
+    //Adds one "label + spinner" row bound to an int field via getter/setter; commits on every change.
     private void addIntSetting(JPanel panel, GridBagConstraints gbc, String label, int min, int max,
                                 java.util.function.IntSupplier getter, java.util.function.IntConsumer setter) {
         gbc.gridx = 0;
@@ -685,21 +793,15 @@ public class NESEmulator extends JFrame implements Runnable {
         tasSettingsDialog.setVisible(true);
     }
 
-    //Drag-painting state for the button-timeline grid; see the mouse listeners in
-    //createTASMakerWindow.
-    //Whether the in-progress mouse drag started on the Frame# column; see the
-    //changeSelection override in createTASMakerWindow.
+    //Drag-painting state for the button-timeline grid; see mouse listeners in createTASMakerWindow.
     private boolean tasFrameColumnDragging = false;
-    //Anchor row of an in-progress right-button drag-select on the Frame# column, or
-    //-1 when no right-drag is active; see the mouse listeners in createTASMakerWindow.
+    //Anchor row of an in-progress right-drag-select on Frame#, or -1 if none active.
     private int tasRightDragAnchor = -1;
     private Integer tasPaintColumn = null;
     private boolean tasPaintValue;
     private int tasPaintLastRow = -1;
 
-    //Stamps tasPaintValue onto every row between tasPaintLastRow and row (inclusive),
-    //clamped to the table's bounds - shared by mouseDragged and the wheel listener so
-    //painting works the same whether the mouse moves or the view scrolls under it.
+    //Stamps tasPaintValue onto rows between tasPaintLastRow and row (inclusive), clamped to bounds.
     private void paintTasRow(int row) {
         if (tasPaintColumn == null) return;
         row = Math.max(0, Math.min(row, tasInputs.size() - 1));
@@ -716,13 +818,8 @@ public class NESEmulator extends JFrame implements Runnable {
     private void openTasMaker() {
         tasActive = true;
         audioPlayer.setMuted(true);
-        //Frame 0 must always mean power-on, but normal real-time play (or just sitting
-        //at the title screen since ROM load) runs the machine forward before the TAS
-        //Maker is ever opened - without this, frame 0 would silently be "whatever the
-        //game happened to be doing" instead of power-on, and the power-on-era lag
-        //frames (before the game's init routine starts polling input) would be lost.
-        //Only do this the first time - if there's already a movie/playhead (the user
-        //closed and reopened the TAS Maker), leave it exactly where it was.
+        //Frame 0 must mean power-on; reset here the first time so pre-TAS-Maker play doesn't
+        //shift that. Skip if a movie/playhead already exists (reopening the TAS Maker).
         if (tasFrame == 0 && tasInputs.isEmpty()) {
             bus.hardReset();
             tasValidFrontier = 0;
@@ -738,10 +835,10 @@ public class NESEmulator extends JFrame implements Runnable {
     private void closeTasMaker() {
         setTasPlaying(false);
         tasActive = false;
-        //Back to normal real-time emulation - always audible.
+        //Back to normal real-time emulation.
         audioPlayer.setMuted(false);
         tasDialog.setVisible(false);
-        //Hand controller 1 back to the keyboard, reflecting whatever's physically held right now.
+        //Hand controller 1 back to the keyboard.
         bus.setController1(controller1Bits | queuedInputBits);
     }
 
@@ -754,22 +851,18 @@ public class NESEmulator extends JFrame implements Runnable {
         if (tasPlayTimer != null) {
             if (playing) tasPlayTimer.start(); else tasPlayTimer.stop();
         }
-        //Stopping Play means every subsequent frame (until Play resumes) goes back
-        //through the always-muted seekToFrame path - mute now so nothing left queued
-        //from the last played frame keeps draining out afterward.
+        //Stopping Play routes subsequent frames through the always-muted seekToFrame path.
         if (!playing) audioPlayer.setMuted(true);
     }
 
-    //Runs one more frame of the movie, appending a new blank (no-input) frame first
-    //if playback has run off the end of what's been recorded so far - this is what
-    //makes the timeline "grow as you play" instead of needing every frame pre-declared.
+    //Runs one more movie frame, appending a blank frame first if playback runs off the
+    //recorded end - lets the timeline grow as you play.
     private void tasAdvanceOneFrame() {
         boolean grew = tasFrame >= tasInputs.size();
         if (grew) tasInputs.add(0);
         int bits = tasFrame == 0 ? 0 : tasInputs.get(tasFrame - 1);
         bus.setController1(bits);
-        //Play is real-time playback, so it's always audible - regardless of whether
-        //the frame it's running happens to already be validated.
+        //Play is real-time, so always audible.
         audioPlayer.setMuted(false);
         updateEmulationFrame();
         int executedRow = tasFrame;
@@ -783,26 +876,15 @@ public class NESEmulator extends JFrame implements Runnable {
         syncTasSelection();
     }
 
-    //Moves the live playhead to "right after frame targetFrame-1 has executed".
-    //Seeking FORWARD from the current playhead to a still-valid target needs no
-    //reset at all - the live cpu/ppu/apu/bus state already reflects every frame up
-    //to tasFrame, so we can just keep running from there. That's the common case
-    //(dragging/playing forward through the timeline) and skipping any restore for it
-    //is what keeps scrubbing responsive. Otherwise (backward, or past an edit that
-    //invalidated the frontier), restore the nearest greenzone checkpoint at or before
-    //targetFrame (see tasCheckpoints) and replay only the remainder - falling back to
-    //a full replay from power-on only if no checkpoint that old exists (e.g. nothing's
-    //been played that far yet, or checkpoints were cleared).
-    //Seeking never shrinks tasValidFrontier (the "how far has this actually been
-    //emulated" marker) - only editFrameInput does, since replaying backward doesn't
-    //invalidate anything, it just re-derives frames that are still known-good.
+    //Moves the live playhead to right after frame targetFrame-1. Forward seeks to a still-valid
+    //target just keep running from the live state (fast path for scrubbing/playing forward).
+    //Otherwise restores the nearest greenzone checkpoint at/before targetFrame and replays the
+    //remainder, falling back to a full power-on replay if no checkpoint exists.
+    //Seeking never shrinks tasValidFrontier - only editFrameInput does.
     private void seekToFrame(int targetFrame) {
         if (targetFrame == tasFrame) return;
-        //Forward-continuing from the live state is only safe if that state is itself
-        //still valid - i.e. every frame it was built from still matches tasInputs.
-        //That's true exactly while tasFrame <= tasValidFrontier; an edit can leave
-        //tasFrame ahead of a (shrunk) frontier without moving the playhead back (see
-        //editFrameInput), so that case has to fall back to a checkpoint/full replay too.
+        //Forward-continuing is only safe while tasFrame <= tasValidFrontier (an edit can leave
+        //tasFrame ahead of a shrunk frontier without moving the playhead - see editFrameInput).
         int replayFrom;
         if (targetFrame > tasFrame && tasFrame <= tasValidFrontier) {
             replayFrom = tasFrame;
@@ -818,11 +900,8 @@ public class NESEmulator extends JFrame implements Runnable {
                 replayFrom = 0;
             }
         }
-        //Seeking/scrubbing of any kind - forward, backward, one row or many - is never
-        //real-time, so it's always silent (and setMuted(true) flushes anything still
-        //queued from before, so a burst of frames here can't leave audio playing back
-        //on its own afterward). Only tasAdvanceOneFrame (the Play button, paced by
-        //tasPlayTimer at 60Hz) or normal non-TAS emulation ever unmute.
+        //Any seek/scrub is never real-time, so always silent. Only tasAdvanceOneFrame
+        //(Play) or normal non-TAS emulation ever unmute.
         audioPlayer.setMuted(true);
         for (int i = replayFrom; i < targetFrame; i++) {
             int bits = (i == 0) ? 0 : (i - 1 < tasInputs.size() ? tasInputs.get(i - 1) : 0);
@@ -838,20 +917,12 @@ public class NESEmulator extends JFrame implements Runnable {
         tasTable.repaint();
     }
 
-    //Captures a greenzone checkpoint for "executedCount frames have now run" if that
-    //count lands on the checkpoint grid (see tasSavestateInterval) and nothing's
-    //cached there yet. The live CPU may be mid-instruction at this exact frame
-    //boundary (a real NTSC frame - 89341/89342 PPU dots - doesn't divide evenly into
-    //CPU instruction boundaries), and CPU.State can only represent a clean boundary
-    //(see its comment) - so this keeps clocking cycles past the boundary, using
-    //whatever controller bits the NEXT frame will read (matching what the caller's
-    //own next loop iteration/tasAdvanceOneFrame call is about to set anyway), until
-    //CPU.isAtInstructionBoundary() goes true. That's normally at most ~7 CPU cycles.
-    //Any strobe that happens during that small drain is still correctly attributed -
-    //it's genuinely part of the next frame's execution, and gets folded into that
-    //frame's own recordFrameStrobe() call once the caller's loop reaches it.
+    //Captures a greenzone checkpoint for executedCount frames if it lands on the checkpoint grid
+    //and isn't cached yet. CPU.State needs a clean instruction boundary, but a frame doesn't divide
+    //evenly into CPU cycles, so this clocks a few extra cycles (~7 max) past the boundary until
+    //CPU.isAtInstructionBoundary() is true; any strobe during that drain still belongs to the next frame.
     private void maybeCaptureTasCheckpoint(int executedCount) {
-        if (executedCount <= 0) return; //frame 0's state is free via bus.hardReset()
+        if (executedCount <= 0) return; //frame 0 is free via bus.hardReset()
         if (tasSavestateInterval <= 0 || executedCount % tasSavestateInterval != 0) return;
         if (tasCheckpoints.containsKey(executedCount)) return;
         int bits = (executedCount - 1 < tasInputs.size()) ? tasInputs.get(executedCount - 1) : 0;
@@ -866,17 +937,13 @@ public class NESEmulator extends JFrame implements Runnable {
         tasCheckpoints.put(executedCount, new TasCheckpoint(bus.snapshot(), displayPanel.snapshotPixels()));
     }
 
-    //Drops every checkpoint whose key is past newFrontier - i.e. any checkpoint that
-    //reflects at least one frame at/after the edit or insertion point, matching
-    //exactly the same cutoff editFrameInput/insertTasFrames already use for
-    //tasValidFrontier (a checkpoint at key == newFrontier only reflects frames
-    //strictly before the change, so it's still good).
+    //Drops checkpoints past newFrontier - same cutoff editFrameInput/insertTasFrames use for
+    //tasValidFrontier (a checkpoint at key == newFrontier is still valid).
     private void invalidateTasCheckpointsFrom(int newFrontier) {
         tasCheckpoints.tailMap(newFrontier, false).clear();
     }
 
-    //Captures whether controller 1 was strobed during the frame that was just
-    //executed, for the TAS Maker's lag-frame coloring (see tasFrameStrobed).
+    //Captures whether controller 1 was strobed this frame, for lag-frame coloring.
     private void recordFrameStrobe(int frameIndex) {
         boolean strobed = bus.consumeStrobedThisFrame();
         while (tasFrameStrobed.size() <= frameIndex) tasFrameStrobed.add(false);
@@ -900,18 +967,9 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Called by TasTableModel when a button box is toggled. Per the tasInputs field
-    //comment, a button pressed on row `row` isn't read by the game until frame
-    //row+1 - so this leaves frame `row` itself alone and invalidates frame row+1
-    //and every one after it (they were all computed against the old input) - exactly
-    //like FCEUX/BizHawk invalidating the greenzone from the affected frame onward. It
-    //does NOT delete the frame or any frame after it: the recorded/inserted inputs
-    //for those frames are left alone, they're just no longer shown as emulated until
-    //they're replayed again. This intentionally does NOT seek/replay anything itself -
-    //editing a button only edits the movie; the playhead stays exactly where it was
-    //until the user explicitly scrubs or plays (see seekToFrame's tasFrame vs.
-    //tasValidFrontier check for why that stays safe even though the live emulated
-    //state may now sit ahead of the newly-shrunk frontier).
+    //Toggles a button box. Since a press on row `row` isn't read until frame row+1, this
+    //invalidates frame row+1 onward (like FCEUX/BizHawk greenzone invalidation) without
+    //deleting any frames or touching the playhead - seekToFrame handles the shrunk frontier.
     private void editFrameInput(int row, int bit, boolean value) {
         int bits = tasInputs.get(row);
         bits = value ? (bits | bit) : (bits & ~bit);
@@ -924,9 +982,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasTable.repaint();
     }
 
-    //Inserts blank frames just after the selected row (or at the end, if nothing is
-    //selected), like FCEUX/BizHawk's "Insert Frames" - for hand-placing frames of
-    //held/released input without having to play through them in real time first.
+    //Inserts blank frames after the selected row (or at the end), like FCEUX/BizHawk's "Insert Frames".
     private void insertTasFrames() {
         String input = JOptionPane.showInputDialog(tasDialog, "Number of blank frames to insert:", "1");
         if (input == null) return;
@@ -950,7 +1006,7 @@ public class NESEmulator extends JFrame implements Runnable {
     }
 
     //Shared by "Insert", "Insert Frames...", and paste-insert: splices `count` blank
-    //(no-input) frames into tasInputs at insertPos, pushing every existing frame at
+    //frames into tasInputs at insertPos, pushing every existing frame at
     //or after insertPos forward, then fixes up validity/checkpoints/markers/playhead
     //to match. See insertClipboardAt for the copied-frames equivalent.
     private void insertBlankFramesAt(int insertPos, int count) {
@@ -959,27 +1015,20 @@ public class NESEmulator extends JFrame implements Runnable {
         insertFramesAt(insertPos, blanks);
     }
 
-    //Splices `frames` into tasInputs at insertPos, pushing every existing frame at or
-    //after insertPos forward by frames.size(). Shared by blank inserts and paste-insert.
+    //Splices `frames` into tasInputs at insertPos, pushing existing frames forward. Shared by
+    //blank inserts and paste-insert.
     private void insertFramesAt(int insertPos, List<Integer> frames) {
         if (frames.isEmpty()) return;
         tasInputs.addAll(insertPos, frames);
         shiftMarkersFrom(insertPos, frames.size());
-        //Every frame index at/after insertPos now refers to different content than
-        //whatever (if anything) was previously validated there, so nothing from
-        //insertPos on can still be trusted as "emulated" - the rows themselves just
-        //haven't been replayed against their new contents yet (recordFrameStrobe
-        //will naturally overwrite stale entries as replay reaches them again).
+        //Frame indices at/after insertPos now refer to different content, so invalidate from there.
         if (insertPos < tasValidFrontier) {
             tasValidFrontier = insertPos;
             invalidateTasCheckpointsFrom(tasValidFrontier);
         }
         tasTableModel.fireTableDataChanged();
 
-        //Frames at/after the insertion point shifted - if the playhead was already
-        //past that point, its state no longer matches the (now different) movie
-        //leading up to it, so walk it back and replay. Inserting ahead of the
-        //playhead doesn't touch anything already played, so nothing to redo there.
+        //If the playhead was already past the insertion point, replay from there.
         if (insertPos < tasFrame) {
             seekToFrame(insertPos);
         } else {
@@ -987,9 +1036,7 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Shifts every marker at/after `pos` by `delta` rows - used whenever frames are
-    //spliced into (or, in principle, removed from) the timeline so markers keep
-    //pointing at the same logical frame instead of the same row index.
+    //Shifts every marker at/after `pos` by `delta` rows so they track logical frames on splice.
     private void shiftMarkersFrom(int pos, int delta) {
         if (tasMarkers.isEmpty() || delta == 0) return;
         TreeMap<Integer, String> shifted = new TreeMap<>();
@@ -1001,8 +1048,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasMarkers.putAll(shifted);
     }
 
-    //The row clipboard/insert/marker operations anchor on: the lowest selected row,
-    //or -1 if nothing is selected (meaning "at the end"/"none").
+    //Anchor for row clipboard/insert/marker ops: lowest selected row, or -1 for none/end.
     private int tasSelectionAnchor() {
         int[] rows = tasTable.getSelectedRows();
         if (rows.length == 0) return -1;
@@ -1055,11 +1101,8 @@ public class NESEmulator extends JFrame implements Runnable {
         return menu;
     }
 
-    //Right-clicking a row that isn't already part of the current selection selects
-    //just that row first (so right-clicking a single frame acts on that frame), but
-    //right-clicking inside an existing multi-row selection leaves it alone - that's
-    //what lets you drag-highlight a group, then right-click within it to copy the
-    //whole group.
+    //Right-click selects just that row unless it's already part of a multi-row selection,
+    //so a drag-highlighted group can still be right-clicked as a whole.
     private void maybeShowTasContextMenu(java.awt.event.MouseEvent e) {
         if (!e.isPopupTrigger()) return;
         int row = tasTable.rowAtPoint(e.getPoint());
@@ -1071,8 +1114,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasContextMenu.show(tasTable, e.getX(), e.getY());
     }
 
-    //Snapshots the controller bitmask of every currently selected frame (in ascending
-    //row order) into tasClipboard.
+    //Snapshots the controller bitmask of every selected frame (ascending row order) into tasClipboard.
     private void copySelectedTasFrames() {
         int[] rows = tasTable.getSelectedRows().clone();
         Arrays.sort(rows);
@@ -1082,11 +1124,8 @@ public class NESEmulator extends JFrame implements Runnable {
         tasClipboard = copied;
     }
 
-    //Paste (overwrite): replaces frames starting at the selection anchor with the
-    //clipboard contents in place - extending the movie if the clipboard runs past
-    //its current end - without shifting anything else.
-    //Paste Insert: splices the clipboard's frames in at the anchor, pushing every
-    //existing frame at/after it forward (like insertFramesAt).
+    //Paste (overwrite): replaces frames from the anchor with clipboard contents, extending
+    //the movie if needed. Paste Insert: splices clipboard frames in at the anchor (like insertFramesAt).
     private void pasteTasFrames(boolean insert) {
         if (tasClipboard == null || tasClipboard.isEmpty()) return;
         int anchor = tasSelectionAnchor();
@@ -1115,9 +1154,7 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Marks the selected (single) frame with a marker - unlabeled, or prompting for a
-    //name when `labeled` is true. Adding a marker to an already-marked frame just
-    //replaces its label.
+    //Marks the selected frame; prompts for a name if `labeled`. Re-marking replaces the label.
     private void addTasMarker(boolean labeled) {
         int row = tasTable.getSelectedRow();
         if (row < 0 || row >= tasInputs.size()) return;
@@ -1132,10 +1169,8 @@ public class NESEmulator extends JFrame implements Runnable {
         tasTable.repaint();
     }
 
-    //Extends the selection backward from the anchor frame to (and including) the
-    //nearest earlier marker, or frame 0 if there is none, and forward from the
-    //anchor to (but excluding) the nearest later marker, or the last frame if there
-    //is none.
+    //Extends selection from the nearest earlier marker (or frame 0) to just before the
+    //nearest later marker (or the last frame).
     private void selectBetweenMarkers() {
         int anchor = tasTable.getSelectedRow();
         if (anchor < 0 || tasInputs.isEmpty()) return;
@@ -1156,9 +1191,7 @@ public class NESEmulator extends JFrame implements Runnable {
         tasTable.repaint();
     }
 
-    //Toggles one controller button across every selected frame: if every selected
-    //frame already has that button pressed, it's cleared from all of them; otherwise
-    //it's set on all of them (matching how DAW/TAS-editor "stamp" tools usually work).
+    //Toggles one button across selected frames: clears if all have it set, else sets all.
     private void toggleInputOnSelection(int bit) {
         int[] rows = tasTable.getSelectedRows();
         if (rows.length == 0) return;
@@ -1181,8 +1214,7 @@ public class NESEmulator extends JFrame implements Runnable {
         menu.show(invoker, 0, invoker.getHeight());
     }
 
-    //Lists every marker (frame number + name) and fast-travels the playhead/selection
-    //to whichever one is clicked.
+    //Lists every marker; double-click fast-travels the playhead to it.
     private void openMarkersDialog() {
         if (tasMarkersDialog == null) {
             tasMarkersDialog = new JDialog(tasDialog, "Markers", false);
@@ -1216,10 +1248,8 @@ public class NESEmulator extends JFrame implements Runnable {
         tasMarkersDialog.setVisible(true);
     }
 
-    //Saves just the movie itself - the per-frame controller 1 bitmask list - as one
-    //decimal value per line. Nothing about the current "savestate" (tasFrame,
-    //tasValidFrontier, tasFrameStrobed) is persisted: loading a TAS always starts
-    //replay from power-on, same as any other seek.
+    //Saves just the movie (per-frame controller bitmasks), one decimal value per line.
+    //No savestate info is persisted - loading always replays from power-on.
     private void saveTas() {
         JFileChooser fileChooser = new JFileChooser();
         fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("TAS files (*.tas)", "tas"));
@@ -1237,9 +1267,7 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Loads a movie saved by saveTas, replacing tasInputs wholesale and restarting
-    //playback from power-on - none of the old savestate (tasFrame/tasValidFrontier/
-    //tasFrameStrobed) carries over, since it described the movie that's being replaced.
+    //Loads a movie saved by saveTas, replacing tasInputs and restarting from power-on.
     private void loadTas() {
         JFileChooser fileChooser = new JFileChooser();
         fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("TAS files (*.tas)", "tas"));
@@ -1273,9 +1301,8 @@ public class NESEmulator extends JFrame implements Runnable {
         syncTasSelection();
     }
 
-    //Scans the whole address space for bytes that changed since the last scan and
-    //fires a targeted update only for those cells. Runs on the emulation thread;
-    //the actual fireTableCellUpdated calls are marshalled to the EDT.
+    //Scans for bytes changed since the last scan and fires targeted cell updates.
+    //Runs on the emulation thread; updates are marshalled to the EDT.
     private void scanMemoryForChanges() {
         List<Integer> changedAddresses = null;
         for (int addr = 0; addr <= 0xFFFF; addr++) {
@@ -1373,7 +1400,6 @@ public class NESEmulator extends JFrame implements Runnable {
         traceDialog.add(new JScrollPane(traceTextArea), BorderLayout.CENTER);
 
         //Refresh UI whenever window is focused
-
         traceDialog.addComponentListener(new ComponentAdapter() {
             @Override
             public void componentShown(ComponentEvent e) {
@@ -1398,6 +1424,10 @@ public class NESEmulator extends JFrame implements Runnable {
         pauseItem.addActionListener(e -> togglePause());
         emulationMenu.add(pauseItem);
 
+        JMenuItem powerItem = new JMenuItem("Power");
+        powerItem.addActionListener(e -> powerCycle());
+        emulationMenu.add(powerItem);
+
         JMenuItem resetItem = new JMenuItem("Reset");
         resetItem.addActionListener(e -> resetEmulation());
         emulationMenu.add(resetItem);
@@ -1413,7 +1443,7 @@ public class NESEmulator extends JFrame implements Runnable {
         JMenu toolsMenu = new JMenu("Tools");
 
         JMenuItem controllerItem = new JMenuItem("Controller Settings...");
-        controllerItem.addActionListener(e -> JOptionPane.showMessageDialog(this, "Controller setup dialog"));
+        controllerItem.addActionListener(e -> controllerDialog.setVisible(true));
         toolsMenu.add(controllerItem);
 
         JMenuItem audioItem = new JMenuItem("Audio Settings...");
@@ -1450,10 +1480,8 @@ public class NESEmulator extends JFrame implements Runnable {
         memoryInspector.addActionListener(e -> memoryDialog.setVisible(true));
         debugMenu.add(memoryInspector);
 
-        //Prints every live OAM entry (index/Y/tile/attr/X, decoded priority+flip+
-        //palette bits) to stdout and a copyable dialog - meant to be used paused,
-        //right when a sprite-rendering bug is visible on screen, so the exact OAM
-        //state behind it can be reported without needing a debugger attached.
+        //Dumps every live OAM entry (decoded) to stdout and a copyable dialog, for reporting
+        //sprite bugs without a debugger.
         JMenuItem dumpOamItem = new JMenuItem("Dump OAM");
         dumpOamItem.addActionListener(e -> {
             String text = ppu.dumpOamText();
@@ -1465,12 +1493,8 @@ public class NESEmulator extends JFrame implements Runnable {
         });
         debugMenu.add(dumpOamItem);
 
-        //Arms a one-shot click on the game display: translates the click into NES
-        //pixel coordinates (accounting for the panel's current scale) and shows
-        //exactly why that pixel is the color it is - background opacity, every
-        //sprite covering that column on that scanline, and which one (if any) won.
-        //Meant to be used paused, right on a frame showing a suspicious sprite/
-        //priority rendering bug, so it can be diagnosed by clicking on it directly.
+        //Arms a one-shot click: translates it to NES pixel coords and explains why that
+        //pixel is that color (background opacity, sprite priority) for diagnosing rendering bugs.
         JMenuItem explainPixelItem = new JMenuItem("Explain Pixel (click screen)...");
         explainPixelItem.addActionListener(e -> {
             JOptionPane.showMessageDialog(this, "Click anywhere on the game screen to explain that pixel.",
@@ -1480,10 +1504,7 @@ public class NESEmulator extends JFrame implements Runnable {
                     displayPanel.removeMouseListener(this);
                     int nx = ev.getX() * NESDisplayPanel.VIEW_WIDTH / Math.max(1, displayPanel.getWidth());
                     int ny = ev.getY() * NESDisplayPanel.VIEW_HEIGHT / Math.max(1, displayPanel.getHeight());
-                    //Shows a 24x24 ASCII grid centered on the click (see explainGrid's
-                    //own comment) - imprecise since a 1:1 click-to-pixel mapping across
-                    //a scaled display isn't exact, but the grid is wide enough that the
-                    //area of interest lands somewhere in it regardless.
+                    //24x24 ASCII grid centered on the click; imprecise but wide enough to cover it.
                     int gx0 = Math.max(0, nx - 12), gy0 = Math.max(0, ny - 12);
                     String text = String.format("clicked (%d,%d)%n%n", nx, ny) + ppu.explainGrid(gx0, gy0, 24, 24);
                     System.out.println(text);
@@ -1504,8 +1525,7 @@ public class NESEmulator extends JFrame implements Runnable {
 
         return menuBar;
     }
-    //Starts the Emulation thread
-
+    //Starts the emulation thread
     public synchronized void start() {
         if (running) return;
         running = true;
@@ -1514,8 +1534,7 @@ public class NESEmulator extends JFrame implements Runnable {
         emulatorThread.start();
     }
 
-    //stops the emulation thread
-
+    //Stops the emulation thread
     public synchronized void stop() {
         running = false;
         try {
@@ -1528,8 +1547,7 @@ public class NESEmulator extends JFrame implements Runnable {
         audioPlayer.stop();
     }
 
-    //Main emulation (~60FPS)
-
+    //Main emulation loop (~60FPS)
     @Override
     public void run() {
         final double nsPerFrame = 1_000_000_000.0 / 60.0;
@@ -1542,7 +1560,6 @@ public class NESEmulator extends JFrame implements Runnable {
             lastTime = now;
 
             //catch up if behind schedule
-
             while (delta >= 1) {
                 if (!paused && !tasActive) {
                     updateEmulationFrame();
@@ -1551,13 +1568,11 @@ public class NESEmulator extends JFrame implements Runnable {
             }
 
             //render current frame
-
             if (!paused && !tasActive) {
                 displayPanel.renderFrame();
             }
 
             //brief pause to give thread CPU time back to the OS
-
             try {
                 Thread.sleep(1);
             } catch (InterruptedException e) {
@@ -1572,8 +1587,7 @@ public class NESEmulator extends JFrame implements Runnable {
         boolean wasTracing = tracingEnabled;
         tracingEnabled = true;
 
-        //Apply any queued taps for this one frame, then drop them so they don't
-        //bleed into subsequent steps - only keys still physically held remain set.
+        //Apply queued taps for this frame, then drop them so they don't bleed into later steps.
         bus.setController1(controller1Bits | queuedInputBits);
         queuedInputBits = 0;
 
@@ -1587,36 +1601,26 @@ public class NESEmulator extends JFrame implements Runnable {
     private void updateEmulationFrame() {
         frameTraceBuffer.setLength(0);
 
-        //Run until the PPU itself reports the start of VBlank rather than a fixed
-        //CPU-cycle count - a real NTSC frame is 89341/89342 PPU dots, which a fixed
-        //count can't evenly divide, so driving off the PPU's own signal is what keeps
-        //NMI/VBlank locked to the same point in every frame. Bounding on VBlank-start
-        //(rather than the scanline-262 wrap) also aligns each trace slice with the
-        //NMI, matching how games structure their own frame loop - see PPU.vblankStarted.
+        //Run until the PPU reports VBlank start rather than a fixed cycle count - a real NTSC
+        //frame (89341/89342 dots) doesn't divide evenly, so this keeps NMI/VBlank timing exact
+        //and aligns trace slices with the NMI (see PPU.vblankStarted).
         do {
-            //APU is clocked before the CPU within the same CPU cycle: on real hardware,
-            //the DMC's memory-reader request (RDY low) and the APU's IRQ line (frame
-            //counter / DMC) are both asserted early enough in the cycle to be visible to
-            //the CPU's own interrupt polling and DMA-halt check THIS cycle - clocking the
-            //APU after the CPU delayed both by a full extra CPU cycle, which is what
-            //AccuracyCoin's "Interrupt Flag Latency" (error 8: DMA IRQ on the wrong CPU
-            //cycle) and "NMI Overlap IRQ" tests (which rely on DMC-driven IRQ timing) catch.
+            //APU clocked before CPU: on real hardware DMC RDY and APU IRQ are visible to the CPU's
+            //interrupt/DMA-halt check this same cycle - clocking after would delay both by a cycle,
+            //breaking AccuracyCoin's Interrupt Flag Latency and NMI Overlap IRQ tests.
             apu.clock();
             cpu.step(frameTraceBuffer, ppu, tracingEnabled);
 
-            //PPU runs 3 clock cycles for every 1 CPU cycle
+            //PPU runs 3 cycles per CPU cycle
             ppu.step();
             ppu.step();
             ppu.step();
         } while (!ppu.consumeVBlankStart());
 
-        //No explicit render call needed here - the PPU already wrote every pixel
-        //directly into the display panel's buffer scanline-by-scanline as it stepped
-        //through the frame above (see PPU.renderScanline), using whatever VRAM/OAM/
-        //scroll state genuinely existed at that instant rather than a snapshot taken
-        //after the fact.
+        //No explicit render call needed - the PPU already wrote pixels into the display
+        //buffer scanline-by-scanline as it stepped (see PPU.renderScanline).
 
-        //Update Trace UI text area if active
+        //Update trace UI text area if active
         if (tracingEnabled && frameTraceBuffer.length() > 0) {
             SwingUtilities.invokeLater(() -> traceTextArea.setText(frameTraceBuffer.toString()));
             if (traceFileWriter != null) {
@@ -1629,8 +1633,7 @@ public class NESEmulator extends JFrame implements Runnable {
             }
         }
 
-        //Update Memory Inspector if visible - scans for changed bytes and only
-        //fires table updates for those cells, so it never resets scroll position.
+        //Update Memory Inspector if visible - only fires updates for changed cells.
         if (memoryDialog.isVisible()) {
             scanMemoryForChanges();
         }
@@ -1664,7 +1667,7 @@ public class NESEmulator extends JFrame implements Runnable {
         setPaused(!paused);
     }
 
-    //Synchronizes pause states across thread boundaries and updates UI elements
+    //Syncs pause state across threads and updates UI
     private void setPaused(boolean pauseState) {
         this.paused = pauseState;
         System.out.println(paused ? "Emulation Paused" : "Emulation Resumed");
@@ -1676,7 +1679,7 @@ public class NESEmulator extends JFrame implements Runnable {
         System.out.println(paused ? "Emulation Paused" : "Emulation Resumed");
     }
 
-    //Updates debugger
+    //Updates debug UI controls
     private void updateDebugUI() {
         if (stepButton != null) {
             stepButton.setEnabled(paused);
@@ -1691,9 +1694,15 @@ public class NESEmulator extends JFrame implements Runnable {
         bus.reset();
     }
 
-    public static void main(String[] args) {
-        //Swing GUI components should always be initialized on the Event Dispatch Thread (EDT)
+    //Full power-on cycle: also clears RAM (soft reset leaves RAM intact).
+    private void powerCycle() {
+        System.out.println("Power cycling (RAM cleared)...");
+        bus.hardReset();
+        displayPanel.renderFrame();
+    }
 
+    public static void main(String[] args) {
+        //Swing components must be initialized on the EDT
         SwingUtilities.invokeLater(() -> {
             NESEmulator emulator = new NESEmulator();
             emulator.setVisible(true);

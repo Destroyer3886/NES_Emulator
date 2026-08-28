@@ -1,5 +1,5 @@
 public class Bus {
-    //2KB NES Internal RAM ($0000 - $07FF)
+    //2KB Internal RAM ($0000-$07FF)
     private final byte[] ram = new byte[2048];
 
     private CPU cpu;
@@ -7,17 +7,14 @@ public class Bus {
     private final APU apu;
     private Cartridge cartridge;
 
-    //Standard NES controller shift registers ($4016/$4017). Bit order shifted out
-    //LSB-first: A, B, Select, Start, Up, Down, Left, Right.
-    private int controller1 = 0; //live button bitmask, set by the UI
+    //Controller shift registers ($4016/$4017), LSB-first: A,B,Select,Start,Up,Down,Left,Right
+    private int controller1 = 0; //live button bitmask from UI
     private int controller2 = 0;
     private int controller1Shift = 0;
     private int controller2Shift = 0;
     private boolean controllerStrobe = false;
 
-    //Set by any $4016 write that strobes the controllers (see cpuWrite); consumed
-    //once per frame by the TAS Maker via consumeStrobedThisFrame() to tell lag
-    //frames (never strobed) from normal ones.
+    //Set by a $4016 strobe write; consumed each frame by TAS Maker to detect lag frames
     private boolean strobedThisFrame = false;
     public boolean consumeStrobedThisFrame() {
         boolean result = strobedThisFrame;
@@ -25,8 +22,7 @@ public class Bus {
         return result;
     }
 
-    //CPU cycle at which the $4016 strobe line was most recently asserted; used to
-    //work out whether the high period covered a "put" cycle. See cpuWrite's $4016 case.
+    //Cycle the $4016 strobe line was last asserted; used to check if a "put" cycle occurred
     private long strobeHighSince = 0;
 
     private void latchControllers() {
@@ -63,15 +59,16 @@ public class Bus {
         if (ppu != null) ppu.reset();
     }
 
-    //Full power-on reset (CPU/PPU/APU/cartridge CHR RAM, plus this Bus's own
-    //controller shift-register state) rather than the soft-reset reset() above.
-    //Used only by the TAS Maker's replay-from-power-on seeking, where every replay
-    //of the same recorded input log must land on exactly the same state.
+    //Full power-on reset (vs. soft reset() above); used by TAS Maker replay-from-power-on
+    //so replays of the same input log land on identical state
     public void hardReset() {
         if (cpu != null) cpu.reset();
         if (ppu != null) ppu.hardReset();
         if (apu != null) apu.reset();
         if (cartridge != null) cartridge.hardReset();
+        java.util.Arrays.fill(ram, (byte) 0);
+        //Re-pin Memory Inspector "Freeze"s so power cycle doesn't drop them
+        for (java.util.Map.Entry<Integer, Byte> entry : frozenRam.entrySet()) ram[entry.getKey()] = entry.getValue();
         controller1 = 0;
         controller2 = 0;
         controller1Shift = 0;
@@ -81,18 +78,17 @@ public class Bus {
     }
 
     public byte cpuRead(int address) {
-        address &= 0xFFFF; //Mask to 16 bit
+        address &= 0xFFFF; //mask to 16-bit
 
-        //1. 2KB Internal RAM mirrored up to $1FFF
+        //1. Internal RAM, mirrored to $1FFF
         if (address >= 0x0000 && address <= 0x1FFF) {
             return ram[address & 0x7FF];
         }
-        //2. PPU Registers ($2000 - $3FFF) mirrored every 8 bytes
+        //2. PPU Registers, mirrored every 8 bytes
         else if (address >= 0x2000 && address <= 0x3FFF) {
             return ppu.cpuRead(0x2000 + (address & 0x0007));
         }
-        //3. Controller Port 1 ($4016): shift out one button bit per read, LSB first.
-        //   Only bit 0 is driven by the controller; the upper 3 bits are open bus.
+        //3. Controller Port 1: shift out one bit per read; upper 3 bits open bus
         else if (address == 0x4016) {
             int bit;
             if (controllerStrobe) {
@@ -103,7 +99,7 @@ public class Bus {
             }
             return (byte) ((cpuOpenBus() & 0xE0) | bit);
         }
-        //4. Controller Port 2 ($4017)
+        //4. Controller Port 2
         else if (address == 0x4017) {
             int bit;
             if (controllerStrobe) {
@@ -114,27 +110,22 @@ public class Bus {
             }
             return (byte) ((cpuOpenBus() & 0xE0) | bit);
         }
-        //5. APU & Direct I/O Registers ($4000 - $4015)
+        //5. APU & Direct I/O Registers
         else if (address >= 0x4000 && address <= 0x4015) {
             return apu.cpuRead(address);
         }
-        //6. Cartridge PRG RAM ($6000-$7FFF, mapper 4/MMC3 boards only) and PRG ROM
-        //   ($8000-$FFFF). NROM has nothing mapped below $8000, so $4018-$5FFF
-        //   (and $6000-$7FFF on NROM carts, which have no PRG RAM) fall through to
-        //   open bus below.
+        //6. Cartridge PRG RAM (MMC3 only) and PRG ROM; NROM has nothing here, falls to open bus
         else if (address >= 0x6000 && address <= 0x7FFF) {
             if (cartridge != null && cartridge.getMapperID() == 4) return cartridge.cpuRead(address);
         }
         else if (address >= 0x8000 && address <= 0xFFFF) {
             if (cartridge != null) return cartridge.cpuRead(address);
         }
-        //Anything else (e.g. $4018-$7FFF, or cartridge space with no mapping) is open
-        //bus: the floating CPU data bus, not a fixed value.
+        //Anything unmapped is open bus: the floating CPU data bus
         return (byte) cpuOpenBus();
     }
 
-    //Value the CPU's internal data bus is currently holding - what an "open bus" read
-    //returns, since nothing actually drives the bus for that address.
+    //Current value of the CPU's floating data bus, returned for open-bus reads
     private int cpuOpenBus() {
         return cpu != null ? cpu.dataBus : 0;
     }
@@ -142,56 +133,47 @@ public class Bus {
     public void cpuWrite(int address, byte data) {
         address &= 0xFFFF;
 
-        //1. 2KB Internal RAM mirrored up to $1FFF
+        //1. Internal RAM, mirrored to $1FFF
         if (address >= 0x0000 && address <= 0x1FFF) {
-            ram[address & 0x07FF] = data;
+            int ramAddr = address & 0x07FF;
+            //Frozen (Memory Inspector "Freeze") addresses ignore writes
+            Byte frozenValue = frozenRam.get(ramAddr);
+            ram[ramAddr] = frozenValue != null ? frozenValue : data;
         }
 
-        //2. PPU Registers ($2000 - $3FFF)
+        //2. PPU Registers
         else if (address >= 0x2000 && address <= 0x3FFF) {
             ppu.cpuWrite(0x2000 + (address & 0x0007), data);
         }
 
-        //3. OAM DMA ($4014): copies one 256-byte page into PPU OAM, stalling the CPU
+        //3. OAM DMA: copies a 256-byte page into PPU OAM, stalling the CPU
         else if (address == 0x4014) {
             oamDma(data & 0xFF);
         }
-        //4. Controller Strobe ($4016): while high, both shift registers continuously
-        //   reload from the live button state; the falling edge latches them for shifting.
+        //4. Controller Strobe: while high, shift registers continuously reload from
+        //   buttons; falling edge latches them
         else if (address == 0x4016) {
-            //Any write with bit 0 set strobes the controllers (matches AccuracyCoin's
-            //"Controller Strobing" test 2) - recorded here regardless of the previous
-            //strobe state so the TAS Maker can tell whether a frame ever read input at
-            //all, i.e. whether it was a "lag frame" the game didn't act on.
+            //Any write with bit 0 set strobes controllers, regardless of prior state,
+            //so TAS Maker can detect lag frames (AccuracyCoin "Controller Strobing" test 2)
             if ((data & 0x01) != 0) strobedThisFrame = true;
             boolean nowHigh = (data & 0x01) != 0;
-            //The strobe line does not itself copy the buttons into the shift
-            //registers. It merely holds the parallel-load input asserted; the actual
-            //load happens on the CPU's "put" cycles while it is asserted. A normal
-            //`STA $4016` / `STA $4016` pair holds the line high for ~6 cycles, which
-            //always spans a put cycle, so it always latches. But `DEC $4016` holds it
-            //high for exactly one cycle, and then whether the controllers latch at
-            //all depends purely on whether that single cycle was a put or a get -
-            //which is exactly what AccuracyCoin's "Controller Strobing" tests 3 and 4
-            //check (test 3 lands on a put and must latch; test 4 lands on a get and
-            //must not).
-            //
-            //totalCycles has not yet been incremented for the cycle this write is
-            //happening on (see CPU.oamAlignRemaining's comment), so the write's own
-            //cycle number is totalCycles, and an even value is a put cycle.
+            //The strobe line just holds parallel-load asserted; actual latch happens on
+            //CPU "put" cycles during assertion. STA/STA holds ~6 cycles (always spans a
+            //put, always latches); DEC holds exactly 1 cycle, so whether it latches
+            //depends on put vs. get for that single cycle (AccuracyCoin tests 3 & 4).
+            //totalCycles isn't incremented yet for this write's own cycle, so an even
+            //value here means a put cycle.
             if (nowHigh && !controllerStrobe) {
                 strobeHighSince = cpu.totalCycles;
                 if ((cpu.totalCycles & 1L) == 0) latchControllers();
             } else if (!nowHigh && controllerStrobe) {
-                //Falling edge: the line was asserted for cycles [strobeHighSince,
-                //totalCycles-1]. If any of those was a put cycle, the registers were
-                //loaded at some point during the high period.
+                //Falling edge: latch if any cycle in the asserted window was a put cycle
                 long first = strobeHighSince, last = cpu.totalCycles - 1;
                 if ((first & 1L) == 0 || last > first) latchControllers();
             }
             controllerStrobe = nowHigh;
         }
-        //5. APU & Direct I/O Registers ($4000 - $4015, $4017 frame counter)
+        //5. APU & Direct I/O Registers, incl. $4017 frame counter
         else if (address >= 0x4000 && address <= 0x4017) {
             apu.cpuWrite(address, data);
         }
@@ -201,8 +183,31 @@ public class Bus {
         }
     }
 
-    //Non-mutating read across the full $0000-$FFFF CPU address space, for the memory inspector.
-    //Mirrors cpuRead's address decoding but never triggers register read side-effects.
+    //Memory Inspector "Freeze"/"Override" support, keyed by mirrored RAM address
+    private final java.util.Map<Integer, Byte> frozenRam = new java.util.HashMap<>();
+
+    public void freezeRamAddress(int address, byte value) {
+        int ramAddr = address & 0x07FF;
+        frozenRam.put(ramAddr, value);
+        ram[ramAddr] = value;
+    }
+
+    public void unfreezeRamAddress(int address) {
+        frozenRam.remove(address & 0x07FF);
+    }
+
+    public boolean isRamAddressFrozen(int address) {
+        return frozenRam.containsKey(address & 0x07FF);
+    }
+
+    //Forces a value into RAM (Memory Inspector "Override"); updates frozen value too
+    public void overrideRamAddress(int address, byte value) {
+        int ramAddr = address & 0x07FF;
+        ram[ramAddr] = value;
+        if (frozenRam.containsKey(ramAddr)) frozenRam.put(ramAddr, value);
+    }
+
+    //Non-mutating full-address-space read for the memory inspector; no register side-effects
     public byte debugRead(int address) {
         address &= 0xFFFF;
 
@@ -211,7 +216,7 @@ public class Bus {
         } else if (address >= 0x2000 && address <= 0x3FFF) {
             return ppu.debugRead(0x2000 + (address & 0x0007));
         } else if (address == 0x4014) {
-            return 0; //write-only OAMDMA latch
+            return 0; //write-only latch
         } else if (address == 0x4016) {
             return (byte) (controllerStrobe ? (controller1 & 0x01) : (controller1Shift & 0x01));
         } else if (address == 0x4017) {
@@ -224,19 +229,12 @@ public class Bus {
         return 0;
     }
 
-    //OAM DMA is now a genuine cycle-stepped state machine living on CPU (see
-    //CPU.startOamDma()/runOamDmaCycle()) rather than a synchronous bulk copy - this
-    //lets a DMC DMA request interleave with it mid-transfer, per the nesdev wiki's
-    //"DMC DMA during OAM DMA" page (AccuracyCoin's "DMC DMA + OAM DMA", "Explicit
-    //DMA Abort" and "Implicit DMA Abort" tests specifically exercise this).
+    //Delegates to CPU's cycle-stepped DMA state machine so DMC DMA can interleave mid-transfer
     private void oamDma(int page) {
         if (cpu != null) cpu.startOamDma(page);
     }
 
-    //TAS Maker greenzone checkpoint support: one composite snapshot of the whole
-    //machine (CPU + PPU + APU + Bus's own RAM/controller-shift state + cartridge CHR
-    //RAM), so the TAS Maker only has to hold one object per checkpointed frame. Only
-    //ever captured at a CPU instruction boundary - see CPU.State's comment for why.
+    //TAS Maker greenzone checkpoint: full machine snapshot, one object per checkpointed frame
     public static final class EmulatorState {
         CPU.State cpu;
         PPU.State ppu;
@@ -287,9 +285,7 @@ public class Bus {
         return cartridge != null ? cartridge.getMirrorMode() : Cartridge.MirrorMode.VERTICAL;
     }
 
-    //Called once per scanline by the PPU (see PPU.step()) to drive a mapper's own
-    //scanline-based IRQ counter (currently just MMC3/mapper 4) - a no-op for any
-    //other mapper.
+    //Called once per scanline to drive a mapper's IRQ counter (currently MMC3 only)
     public void clockMapperIRQ() {
         if (cartridge != null) cartridge.clockMapperIRQ();
     }

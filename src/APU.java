@@ -1,8 +1,5 @@
-//Full 2A03 APU: 2 pulse channels, triangle, noise, DMC, and the frame sequencer that
-//drives their length counters/envelopes/sweep/linear counter. getOutputSample() mixes
-//them down per the standard non-linear NES formulas; clock() downsamples that to
-//44100Hz and pushes it to the connected AudioPlayer (see connectAudioPlayer). Every
-//register and the DMC's DMA/IRQ interaction with the CPU is modeled.
+//2A03 APU: pulse x2, triangle, noise, DMC, frame sequencer. Mixed via getOutputSample(),
+//downsampled to 44100Hz in clock(). Models DMC DMA/IRQ interaction with CPU.
 public class APU {
 
     private CPU cpu;
@@ -11,11 +8,8 @@ public class APU {
     private AudioPlayer audioPlayer;
     public void connectAudioPlayer(AudioPlayer audioPlayer) { this.audioPlayer = audioPlayer; }
 
-    //Downsamples the ~1.789773MHz CPU/APU clock down to the audio device's 44100Hz by
-    //averaging every mixer sample produced between two output samples (a cheap
-    //box-filter anti-alias) and emitting one output sample whenever enough CPU cycles
-    //have accumulated - tracked with a running remainder so the 40.6:1 ratio doesn't
-    //drift over time.
+    //Downsamples ~1.789773MHz CPU clock to 44100Hz via box-filter averaging;
+    //remainder tracked so the 40.6:1 ratio doesn't drift.
     private static final double CPU_HZ = 1789773.0;
     private static final double SAMPLE_HZ = 44100.0;
     private double sampleCycleAccumulator = 0;
@@ -49,7 +43,7 @@ public class APU {
     private class Envelope {
         boolean loop;
         boolean constantVolume;
-        int volume; //also doubles as the envelope's own divider period
+        int volume; //also divider period
         boolean start;
         int divider;
         int decay;
@@ -279,19 +273,12 @@ public class APU {
         boolean dmaPending;
         boolean irqFlag;
 
-        //Cycles left until a pending restart (see writeEnableFlag()) actually reloads
-        //currentAddress/bytesRemaining; 0 means no restart is pending.
+        //Cycles left until a pending restart reloads currentAddress/bytesRemaining; 0 = none pending.
         int enableDelay = 0;
 
-        //Implicit DMA Abort ("1-cycle DMA"): counts down from a small grace window the
-        //instant a non-looping sample plays its last byte (dmaCompleted() leaving the
-        //buffer empty with nothing queued). While this is still >0, a fresh $4015
-        //re-enable's 3-cycle delay (enableDelay) finishing sees the "sample just
-        //ended" and "reload due" conditions as colliding, and fuses them into the
-        //special 1-cycle DMA (see CPU.requestDmcDma1Cycle()) instead of the ordinary
-        //halt-based one. This is deliberately short-lived (not a persistent "buffer is
-        //empty" latch) - the quirk is specifically about the two events landing on
-        //(essentially) the same cycle, not merely both having happened at some point.
+        //Implicit DMA Abort ("1-cycle DMA") grace window: counts down after a non-looping
+        //sample's last byte plays. If a $4015 re-enable's reload lands while this is still
+        //>0, fuse into the special 1-cycle DMA instead of the ordinary halt-based one.
         int naturalEndGraceCycles = 0;
         boolean sampleJustEndedNaturally() { return naturalEndGraceCycles > 0; }
 
@@ -307,54 +294,38 @@ public class APU {
         void writeSampleAddress(int val) { sampleAddress = 0xC000 + (val * 64); }
         void writeSampleLength(int val) { sampleLength = (val * 16) + 1; }
 
-        //$4015's DMC-enable bit doesn't restart a stopped sample the instant it's
-        //written - real hardware's restart takes effect 3 CPU cycles later (see
-        //AccuracyCoin's Delta Modulation Channel tests L/M/N: "The Delta Modulation
-        //Channel will be enabled in 3 CPU cycles"). The gating condition for whether
-        //a write restarts anything at all is bytesRemaining==0 - true both right after
-        //an explicit disable AND right after a non-looping sample plays out its last
-        //byte and fires its IRQ (dmaCompleted() leaves bytesRemaining at 0 in that
-        //case too) - NOT a separate persistent "was this channel ever enabled" latch;
-        //DMASync_TheGoodOne (and every AccuracyCoin test built on it) re-triggers this
-        //exact restart path many times over a run, each time relying on whatever
-        //sample was previously looping/playing having already reached bytesRemaining
-        //0 by then. While enableDelay counts down, bytesRemaining stays 0, so the
-        //ordinary "if (bytesRemaining>0) requestDma()" checks in clockTimer() below
-        //already retry every cycle for free once it's reloaded - no extra state needed.
+        //$4015 DMC-enable restart takes effect 3 CPU cycles later on real hardware
+        //(AccuracyCoin DMC tests L/M/N). Gated on bytesRemaining==0, not a persistent
+        //"ever enabled" latch.
         void writeEnableFlag(boolean enable) {
-            if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] writeEnableFlag("+enable+") bytesRemaining="+bytesRemaining+" enableDelay="+enableDelay+" dmaPending="+dmaPending+" naturalEndGraceCycles="+naturalEndGraceCycles);
+            if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] writeEnableFlag("+enable+") bytesRemaining="+bytesRemaining+" enableDelay="+enableDelay+" dmaPending="+dmaPending+" naturalEndGraceCycles="+naturalEndGraceCycles+" timerValue="+timerValue+" bitsRemaining="+bitsRemaining+" bufferHasData="+bufferHasData);
             if (!enable) {
+                //Explicit DMA Abort: disabling 1-2 cycles before a reload DMA would fire
+                //still starts a phantom DMA, aborted after one cycle (AccuracyCoin answer key).
+                boolean reloadArmed = bitsRemaining == 0 && bufferHasData && bytesRemaining > 0;
+                if (!dmaPending && reloadArmed && timerValue + 1 <= 2 && cpu != null) {
+                    cpu.startAbortedDmcDma();
+                }
                 bytesRemaining = 0;
                 enableDelay = 0;
-                //An explicit disable clears the "sample just ended naturally" memory
-                //too - a reload after THIS kind of empty is the ordinary halt-based
-                //DMA, not the fused 1-cycle one (see naturalEndGraceCycles's decl).
+                //Explicit disable also clears the natural-end grace window.
                 naturalEndGraceCycles = 0;
-                //Explicit DMA Abort: notify the CPU side, which may need to truncate an
-                //already-scheduled-but-not-yet-halting DMC DMA request down to a single
-                //aborted cycle (or drop it entirely, if the halt is blocked by a write
-                //cycle) - see CPU.cancelDmcDma().
+                //Notify CPU to truncate/drop an already-scheduled DMC DMA halt.
                 if (cpu != null) cpu.cancelDmcDma();
             } else if (bytesRemaining == 0 && enableDelay == 0) {
-                enableDelay = 3;
+                enableDelay = 2;
             }
         }
 
-        //isReload distinguishes the two DMC DMA scheduling shapes DMA Info.txt describes:
-        //the "load" DMA (right after $4015 enable finds an empty buffer) schedules to
-        //halt the CPU on a get cycle, while every subsequent "reload" DMA (buffer
-        //emptied during ongoing playback) schedules to halt on a put cycle. CPU.java's
-        //maybeStartDmcHalt() needs this distinction (not derivable from the DMA's own
-        //address or any other existing state) to compute the correct 2-vs-3 halt cycle
-        //count - see its comment.
+        //isReload: "load" DMA halts on a get cycle, "reload" DMA halts on a put cycle
+        //(CPU.maybeStartDmcHalt() needs this to pick 2-vs-3 halt cycles).
         void requestDma(boolean isReload) {
             if (dmaPending || bytesRemaining == 0) return;
             dmaPending = true;
             if (cpu != null) cpu.requestDmcDma(currentAddress, isReload);
         }
 
-        //See sampleJustEndedNaturally's declaration and CPU.requestDmcDma1Cycle()'s
-        //comment for what makes this variant different from requestDma().
+        //Variant of requestDma() for the fused 1-cycle DMA case.
         void requestDma1Cycle() {
             if (dmaPending || bytesRemaining == 0) return;
             dmaPending = true;
@@ -363,13 +334,8 @@ public class APU {
 
         void dmaCompleted(int value) {
             dmaPending = false;
-            //If the channel was disabled (writeEnableFlag(false)) while this DMA was
-            //already in flight, bytesRemaining was forced to 0 out from under it - the
-            //fetched byte must be discarded rather than committed to the buffer/address
-            //counter, otherwise bytesRemaining-- below goes negative and permanently
-            //wedges the channel (writeEnableFlag(true)'s restart condition never sees
-            //bytesRemaining==0 again). See CPU.cancelDmcDma() for the matching CPU-side
-            //abort of the DMA's own halt cycles.
+            //If disabled while in flight, bytesRemaining was forced to 0 - discard the
+            //byte instead of committing it, else bytesRemaining-- wedges the channel.
             if (bytesRemaining == 0) return;
             bufferByte = value & 0xFF;
             bufferHasData = true;
@@ -381,11 +347,13 @@ public class APU {
                     currentAddress = sampleAddress;
                     bytesRemaining = sampleLength;
                 } else {
-                    //Opens the brief window a fresh $4015 re-enable can fuse with -
-                    //see naturalEndGraceCycles's declaration. Set regardless of
-                    //irqEnable: the 1-cycle DMA quirk is about the memory reader's
-                    //own empty/reload state, not the (independent) IRQ flag.
+                    //Opens the grace window a fresh $4015 re-enable can fuse with.
                     naturalEndGraceCycles = 3;
+                    //Implicit DMA Abort: same phantom 1-cycle DMA as the explicit case,
+                    //triggered by a non-looping sample's last byte landing (AccuracyCoin
+                    //"Implicit DMA Abort" keys 1/2). 3-cycle offset matches hardware
+                    //noticing the stop at the output cycle, not the fetch cycle.
+                    if (bitsRemaining == 0 && timerValue + 1 <= 2) abortedDmaDelay = 3;
                     if (irqEnable) {
                         irqFlag = true;
                         updateIrqLine();
@@ -394,10 +362,11 @@ public class APU {
             }
         }
 
+        //Cycles left before phantom aborted DMA is asserted; 0 = none scheduled.
+        int abortedDmaDelay = 0;
+
         void clockTimer() {
-            //Runs every CPU cycle regardless of timerValue's phase - see
-            //writeEnableFlag() for why this delay exists and why no extra retry
-            //state is needed beyond the ordinary requestDma() calls below.
+            if (abortedDmaDelay > 0 && --abortedDmaDelay == 0 && cpu != null) cpu.startAbortedDmcDma();
             if (enableDelay > 0) {
                 enableDelay--;
                 if (enableDelay == 0) {
@@ -405,12 +374,8 @@ public class APU {
                     bytesRemaining = sampleLength;
                     if (CPU.debugDma) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] enableDelay reload bufferHasData="+bufferHasData+" naturalEndGraceCycles="+naturalEndGraceCycles);
                     if (!bufferHasData) {
-                        //If the memory reader is still within the brief window after a
-                        //sample "just ended naturally", the reload and that empty
-                        //condition are colliding - fuse into the special 1-cycle DMA.
-                        //Otherwise (buffer was emptied some other way, e.g. an
-                        //explicit disable, or too long ago) this is an ordinary
-                        //fresh DMA.
+                        //Within the natural-end grace window: fuse into the 1-cycle DMA.
+                        //Otherwise an ordinary fresh DMA.
                         if (sampleJustEndedNaturally()) {
                             naturalEndGraceCycles = 0;
                             requestDma1Cycle();
@@ -422,14 +387,8 @@ public class APU {
             }
 
             if (timerValue == 0) {
-                //Unlike Pulse/Triangle's timerPeriod (a raw register value that's already
-                //"hardware period - 1" by convention, so this same reload-then-count-to-zero
-                //shape correctly yields timerPeriod+1 real cycles), DMC_RATE_TABLE's entries
-                //ARE the exact CPU-cycle interval between output clocks. Reloading with the
-                //raw table value here would make every DMC output clock take one cycle too
-                //long, which is invisible in most tests (they leave slack around the DMA) but
-                //fatal to AccuracyCoin's Interrupt Flag Latency test 8, which needs the DMC's
-                //sample-end DMA/IRQ to land on one exact CPU cycle.
+                //DMC_RATE_TABLE entries are the exact cycle interval (unlike Pulse/Triangle's
+                //period-1 convention), so subtract 1 here or every clock runs 1 cycle long.
                 timerValue = DMC_RATE_TABLE[rateIndex] - 1;
 
                 if (bitsRemaining == 0) {
@@ -454,17 +413,12 @@ public class APU {
                 timerValue--;
             }
 
-            //Let the 1-cycle-DMA collision window (see naturalEndGraceCycles's
-            //declaration) expire on its own if nothing consumed it above.
+            //Let the grace window expire on its own if unused above.
             if (naturalEndGraceCycles > 0) naturalEndGraceCycles--;
         }
     }
 
-    //TAS Maker greenzone checkpoint support - see CPU.State's comment for why this is
-    //only ever captured/restored at a CPU instruction boundary. One static holder
-    //class per channel (Envelope is embedded directly into whichever channel owns it,
-    //matching the live object graph) rather than one flat field list, since Pulse1/
-    //Pulse2/Noise each carry their own Envelope instance.
+    //TAS Maker greenzone checkpoint support; one static holder class per channel.
     public static final class EnvelopeState {
         boolean loop, constantVolume;
         int volume;
@@ -652,11 +606,7 @@ public class APU {
     private Noise noise = new Noise();
     private Dmc dmc = new Dmc();
 
-    //Full power-on reset: re-creates every channel from scratch (clearing timers,
-    //envelopes, length counters, the DMC's DMA/IRQ state, etc.) and re-zeroes the
-    //frame sequencer and audio downsampler. Only used by the TAS Maker's "replay
-    //from power-on" seeking - normal gameplay never calls this, since a real NES
-    //reset button doesn't touch the APU this thoroughly.
+    //Full power-on reset. Only used by TAS Maker's replay-from-power-on seeking.
     public void reset() {
         pulse1 = new Pulse(true);
         pulse2 = new Pulse(false);
@@ -703,29 +653,22 @@ public class APU {
 
     private void updateIrqLine() {
         if (cpu == null) return;
-        //The frame counter's IRQ level detector is only pulled low when interrupts
-        //aren't suppressed. The $4015 flag itself can be set while suppressed (see
-        //stepFrameSequencer's 29828/29829 cases), but that must not raise an IRQ.
+        //IRQ line only pulled low when not suppressed, even though the $4015 flag
+        //itself can be set while suppressed.
         if ((frameIrqFlag && !irqInhibit) || dmc.irqFlag) cpu.raiseIRQ();
         else cpu.clearIRQ();
     }
 
-    //Set to the CPU cycle number of a $4015 read that is due to clear the frame
-    //counter IRQ flag; -1 when nothing is pending. See cpuRead's $4015 case.
+    //CPU cycle of a pending $4015 read's frame-IRQ-flag clear; -1 = none pending.
     private long frameIrqClearAfterCycle = -1;
 
-    //The frame counter's IRQ level detector follows the $4015 flag one CPU cycle
-    //behind, so the CPU sees the IRQ line go low one cycle after the flag reads as
-    //set. AccuracyCoin "Frame Counter IRQ" tests N and O pin this down to the exact
-    //cycle by counting how many INX instructions execute before the IRQ is taken.
+    //IRQ level detector follows the $4015 flag one CPU cycle behind (AccuracyCoin
+    //"Frame Counter IRQ" tests N/O).
     private boolean frameIrqAssertPending = false;
 
     //Advances every part of the APU by one CPU cycle.
     public void clock() {
-        //Deferred $4015 IRQ-flag clear, performed on the first "get" cycle strictly
-        //after the read's own cycle. clock() runs ahead of the CPU's bus access for
-        //this cycle, so clearing here makes the new value visible to a read that
-        //happens on this same cycle - which is what the double-read test observes.
+        //Deferred $4015 IRQ-flag clear, on the first "get" cycle after the read.
         if (frameIrqClearAfterCycle >= 0 && cpu != null
                 && cpu.totalCycles > frameIrqClearAfterCycle && (cpu.totalCycles & 1L) == 0L) {
             frameIrqClearAfterCycle = -1;
@@ -749,9 +692,7 @@ public class APU {
             stepFrameSequencer();
         }
 
-        //Triangle and DMC are clocked directly off the CPU clock; only pulse/noise use
-        //the divide-by-2 "APU cycle" (their period tables are already halved to
-        //account for it, DMC's and triangle's are not).
+        //Triangle/DMC clocked off raw CPU clock; pulse/noise use divide-by-2 APU cycle.
         triangle.clockTimer();
         dmc.clockTimer();
         apuCycleToggle = !apuCycleToggle;
@@ -778,16 +719,8 @@ public class APU {
                 case 7457: clockQuarterFrame(); break;
                 case 14913: clockQuarterFrame(); clockHalfFrame(); break;
                 case 22371: clockQuarterFrame(); break;
-                //The frame counter's "set interrupt flag" signal is asserted across
-                //three consecutive CPU cycles, not one. On the first two the $4015
-                //flag is set unconditionally - even with interrupts suppressed - and
-                //only on the third does the suppress flag decide whether it stays set.
-                //That two-cycle window where a suppressed flag still reads as 1 is
-                //what AccuracyCoin "Frame Counter IRQ" tests I-L check, and the
-                //re-assertion on each of those cycles is what makes tests F and G's
-                //"read it, but it gets set again" behavior work.
-                //The IRQ line itself is only ever pulled low when not suppressed -
-                //see updateIrqLine.
+                //Set-interrupt-flag signal spans 3 cycles: unconditional on the first
+                //two, suppress flag decides on the third (AccuracyCoin tests I-L, F-G).
                 case 29828:
                     frameIrqFlag = true;
                     frameIrqAssertPending = true;
@@ -827,18 +760,11 @@ public class APU {
     //-----------------------------------------------------------------
     public void dmcDmaCompleted(int value) { dmc.dmaCompleted(value); }
 
-    //A pending 1-cycle DMA (see CPU.requestDmcDma1Cycle()) got silently dropped
-    //because the next cycle turned out to be a write. dmaPending was already
-    //latched true by Dmc.requestDma1Cycle() when the request was made, and unlike
-    //the normal path (which always eventually calls dmcDmaCompleted() to clear it),
-    //a dropped request never fetches anything - without this, dmaPending would
-    //stay stuck true forever and silently swallow every future DMC DMA request.
+    //A pending 1-cycle DMA got dropped (next cycle was a write); clear dmaPending
+    //since dmcDmaCompleted() will never be called for it.
     public void dmcDma1CycleDropped() { dmc.dmaPending = false; }
 
-    //Explicit DMA Abort: mirrors dmcDma1CycleDropped()'s purpose - a DMC DMA that CPU.java
-    //aborted (see CPU.cancelDmcDma()/maybeStartDmcHalt()) never calls dmcDmaCompleted(), so
-    //without this dmaPending would stay stuck true and the channel would never request
-    //another DMA.
+    //Same as dmcDma1CycleDropped() but for a DMA aborted by CPU.cancelDmcDma().
     public void dmcDmaAborted() { dmc.dmaPending = false; }
 
     //-----------------------------------------------------------------
@@ -854,27 +780,16 @@ public class APU {
             if (dmc.bytesRemaining > 0) val |= 0x10;
             if (frameIrqFlag) val |= 0x40;
             if (dmc.irqFlag) val |= 0x80;
-            //Bit 5 is open bus - it isn't driven by anything in this register. It's
-            //sourced from the CPU's INTERNAL data bus latch (not the external one) -
-            //see CPU.internalDataBus's comment: a concurrent DMC DMA sample-byte read
-            //only drives the external bus, so it must not leak into this bit.
+            //Bit 5 is open bus, sourced from the CPU's internal data bus latch (not
+            //external) so a concurrent DMC DMA read doesn't leak into it.
             val = (val & ~0x20) | ((cpu != null ? cpu.internalDataBus : 0) & 0x20);
 
-            //Reading $4015 clears the frame IRQ flag (but not the DMC IRQ flag) - but
-            //NOT within this read cycle. The clear is performed by the APU's own
-            //sequencer logic on the next "get" cycle, so a read that lands on a get
-            //cycle has its clear take effect on the very next cycle, while a read that
-            //lands on a put cycle doesn't clear until one cycle later still. This is
-            //observable via a double-read instruction (SLO abs,X on $4015) - see
-            //AccuracyCoin "Frame Counter IRQ" tests 6 and 7, whose comments explicitly
-            //recommend implementing it exactly this way rather than clearing inline.
+            //Reading $4015 clears the frame IRQ flag, deferred to the next "get" cycle
+            //(AccuracyCoin "Frame Counter IRQ" tests 6/7, observable via double-read).
             if (frameIrqFlag) frameIrqClearAfterCycle = (cpu != null) ? cpu.totalCycles : -1;
             return (byte) val;
         }
-        //Every other APU register is write-only; CPU.read() is responsible for not
-        //letting this echo actually update the external data bus for $4015, and for
-        //every other address the caller already gets true open bus from Bus.cpuRead's
-        //fallthrough (this method is only reached for $4000-$4015 - see Bus.cpuRead).
+        //Every other APU register is write-only; caller gets open bus (Bus.cpuRead).
         int ob = cpu != null ? cpu.dataBus : 0;
         if (CPU.debugDma && address == 0x4000) System.err.println("[t="+(cpu!=null?cpu.totalCycles:-1)+"] read $4000 -> "+Integer.toHexString(ob)+" pc="+(cpu!=null?Integer.toHexString(cpu.pc):"?"));
         return (byte) ob;
@@ -928,8 +843,7 @@ public class APU {
                 fiveStepMode = (val & 0x80) != 0;
                 irqInhibit = (val & 0x40) != 0;
                 if (irqInhibit) { frameIrqClearAfterCycle = -1; frameIrqFlag = false; updateIrqLine(); }
-                //The sequencer reset takes effect 3 CPU cycles later if this write
-                //landed on an odd CPU cycle, 4 cycles later if even.
+                //Sequencer reset takes effect 3 cycles later on odd write, 4 on even.
                 resetDelay = (cpu != null && (cpu.totalCycles & 1) != 0) ? 3 : 4;
                 break;
             }
