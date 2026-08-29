@@ -137,6 +137,15 @@ public class PPU {
     public int cycle = 0;
     public int scanline = 0;
 
+    //Power-on warm-up: for ~29658 CPU cycles (~2 frames) after power-on, the PPU's
+    //internal circuitry hasn't stabilized and writes to $2000/$2001/$2005/$2006 are
+    //ignored outright (not even latched for later). A reset (not a fresh power-on)
+    //finds the PPU already warm, so this only applies after hardReset(). Missing this
+    //makes register writes during boot take effect a frame earlier than real hardware,
+    //which throws off games (e.g. SMB3) whose init code is timed around it.
+    private static final int PPU_WARMUP_DOTS = 29658 * 3;
+    private int warmupDotsRemaining = 0;
+
     //Debug-only: whether sprite-0-hit fired during the frame that just ended, captured
     //before ppustatus's hit bit is cleared for the new frame - sampling the live bit
     //right after VBlank starts would already reflect the next frame.
@@ -211,6 +220,7 @@ public class PPU {
         vblankStarted = false;
         lastFrameHadHit = false;
         hitOccurredThisFrame = false;
+        warmupDotsRemaining = PPU_WARMUP_DOTS;
     }
 
     //TAS Maker greenzone checkpoint - see CPU.State for why it's only captured/restored
@@ -238,6 +248,7 @@ public class PPU {
         int evalAddr, evalCopyRemaining, evalSecCount, evalSpritesScanned, evalLastReadValue, evalTargetScanline, evalStepsExecuted;
         boolean evalActive;
         int octalLatch, ppuDataReadDelay, ppuDataReadAddr, pendingMaskValue, pendingMaskDelay, pendingVValue, pendingVDelay;
+        int warmupDotsRemaining;
     }
 
     public State snapshot() {
@@ -280,6 +291,7 @@ public class PPU {
         s.octalLatch = octalLatch; s.ppuDataReadDelay = ppuDataReadDelay; s.ppuDataReadAddr = ppuDataReadAddr;
         s.pendingMaskValue = pendingMaskValue; s.pendingMaskDelay = pendingMaskDelay;
         s.pendingVValue = pendingVValue; s.pendingVDelay = pendingVDelay;
+        s.warmupDotsRemaining = warmupDotsRemaining;
         return s;
     }
 
@@ -322,6 +334,7 @@ public class PPU {
         octalLatch = s.octalLatch; ppuDataReadDelay = s.ppuDataReadDelay; ppuDataReadAddr = s.ppuDataReadAddr;
         pendingMaskValue = s.pendingMaskValue; pendingMaskDelay = s.pendingMaskDelay;
         pendingVValue = s.pendingVValue; pendingVDelay = s.pendingVDelay;
+        warmupDotsRemaining = s.warmupDotsRemaining;
     }
 
     //World-space (512x480) scroll X from v + fineX: bit 10 = which world half, coarse
@@ -681,12 +694,14 @@ public class PPU {
         ppuDataBusDecay = PPU_BUS_DECAY_TICKS; //every write fully drives (and re-charges) the bus
         switch (address) {
             case 0x2000: //PPUCTRL
+                if (warmupDotsRemaining > 0) break; //ignored during power-on warm-up
                 ppuctrl = val;
                 t = (t & 0xF3FF) | ((val & 0x03) << 10); //nametable-select bits into t
                 updateNmiLine(); //toggling bit 7 can raise (or drop) the NMI line immediately
                 if (DEBUG_SPRITE0) System.out.printf("  [write $2000=%02x] scanline=%d cycle=%d%n", val, scanline, cycle);
                 break;
             case 0x2001: //PPUMASK - not applied immediately; see PPUMASK_WRITE_DELAY_DOTS
+                if (warmupDotsRemaining > 0) break; //ignored during power-on warm-up
                 pendingMaskValue = val;
                 pendingMaskDelay = PPUMASK_WRITE_DELAY_DOTS;
                 break;
@@ -708,6 +723,7 @@ public class PPU {
                 break;
             }
             case 0x2005: //PPUSCROLL
+                if (warmupDotsRemaining > 0) break; //ignored during power-on warm-up
                 if (!addressLatch) {
                     scrollX = val;
                     t = (t & 0xFFE0) | ((val >> 3) & 0x1F); //coarse X
@@ -722,6 +738,7 @@ public class PPU {
                 }
                 break;
             case 0x2006: //PPUADDR
+                if (warmupDotsRemaining > 0) break; //ignored during power-on warm-up
                 flushPendingV();
                 if (!addressLatch) {
                     t = (t & 0x00FF) | ((val & 0x3F) << 8);
@@ -898,6 +915,8 @@ public class PPU {
 
     public void step() {
         cycle++;
+
+        if (warmupDotsRemaining > 0) warmupDotsRemaining--;
 
         if (pendingMaskDelay > 0 && --pendingMaskDelay == 0) applyPpuMask(pendingMaskValue);
         if (pendingVDelay > 0 && --pendingVDelay == 0) { v = pendingVValue; clockA12(v); }

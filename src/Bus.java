@@ -14,6 +14,11 @@ public class Bus {
     private int controller2Shift = 0;
     private boolean controllerStrobe = false;
 
+    //Fired on each $4016 strobe rising edge (controllers begin reloading). Used by .r08 ACE-mode
+    //playback, which needs to advance to the next input pair on every individual strobe rather
+    //than once per frame - see NESEmulator's onR08ControllerStrobe().
+    public Runnable onControllerStrobe;
+
     //Set by a $4016 strobe write; consumed each frame by TAS Maker to detect lag frames
     private boolean strobedThisFrame = false;
     public boolean consumeStrobedThisFrame() {
@@ -166,6 +171,7 @@ public class Bus {
             if (nowHigh && !controllerStrobe) {
                 strobeHighSince = cpu.totalCycles;
                 if ((cpu.totalCycles & 1L) == 0) latchControllers();
+                if (onControllerStrobe != null) onControllerStrobe.run();
             } else if (!nowHigh && controllerStrobe) {
                 //Falling edge: latch if any cycle in the asserted window was a put cycle
                 long first = strobeHighSince, last = cpu.totalCycles - 1;
