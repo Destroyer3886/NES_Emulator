@@ -1,9 +1,13 @@
-//2A03 APU: pulse x2, triangle, noise, DMC, frame sequencer. Mixed via getOutputSample(),
-//downsampled to 44100Hz in clock(). Models DMC DMA/IRQ interaction with CPU.
+//2A03 APU: pulse x2, triangle, noise, DMC and frame sequencer, mixed in getOutputSample()
+//and downsampled to 44100Hz in clock(). Also models the DMC DMA/IRQ interaction with the CPU.
 public class APU {
 
     private CPU cpu;
     public void connectCPU(CPU cpu) { this.cpu = cpu; }
+
+    //For expansion audio: the cartridge's channels are summed into the mixer
+    private Bus bus;
+    public void connectBus(Bus bus) { this.bus = bus; }
 
     private AudioPlayer audioPlayer;
     public void connectAudioPlayer(AudioPlayer audioPlayer) { this.audioPlayer = audioPlayer; }
@@ -12,6 +16,14 @@ public class APU {
     //remainder tracked so the 40.6:1 ratio doesn't drift.
     private static final double CPU_HZ = 1789773.0;
     private static final double SAMPLE_HZ = 44100.0;
+    //Output rate nudged a fraction of a percent around SAMPLE_HZ to hold the audio queue near
+    //AudioPlayer.TARGET_QUEUE_SAMPLES; the emulator and sound card run off different clocks,
+    //so without this the queue starves (dropouts) or overflows (dropped audio).
+    private double outputSampleHz = SAMPLE_HZ;
+    private static final double MAX_RATE_ADJUST = 0.01;
+    private static final int RATE_CHECK_INTERVAL = 128; //output samples between checks
+    private int samplesSinceRateCheck = 0;
+    private double queuedAverage = -1;
     private double sampleCycleAccumulator = 0;
     private double outputAccum = 0;
     private int outputCount = 0;
@@ -109,6 +121,9 @@ public class APU {
             timerPeriod = (timerPeriod & 0x00FF) | ((val & 0x07) << 8);
             if (enabled) lengthCounter = LENGTH_TABLE[(val >> 3) & 0x1F];
             envelope.start = true;
+            //Hardware restarts the sequencer phase on $4003/$4007 writes; without this two
+            //pulses on the same note (SMB/SMB3 timer countdown) can partially cancel.
+            sequencePos = 0;
         }
 
         int targetPeriod() {
@@ -232,7 +247,9 @@ public class APU {
 
         void clockTimer() {
             if (timerValue == 0) {
-                timerValue = NOISE_PERIOD_TABLE[periodIndex];
+                //NOISE_PERIOD_TABLE is in CPU cycles but this timer runs on the divide-by-2 APU
+                //clock, so halve it (period-1 reload convention); the raw value was an octave too low.
+                timerValue = (NOISE_PERIOD_TABLE[periodIndex] >> 1) - 1;
                 int feedback = (shiftRegister & 1) ^ ((shiftRegister >> (mode ? 6 : 1)) & 1);
                 shiftRegister = (shiftRegister >> 1) | (feedback << 14);
             } else {
@@ -276,9 +293,8 @@ public class APU {
         //Cycles left until a pending restart reloads currentAddress/bytesRemaining; 0 = none pending.
         int enableDelay = 0;
 
-        //Implicit DMA Abort ("1-cycle DMA") grace window: counts down after a non-looping
-        //sample's last byte plays. If a $4015 re-enable's reload lands while this is still
-        //>0, fuse into the special 1-cycle DMA instead of the ordinary halt-based one.
+        //Implicit DMA Abort ("1-cycle DMA") grace window, counting down after a non-looping
+        //sample's last byte; a $4015 re-enable reload landing while >0 fuses into the 1-cycle DMA.
         int naturalEndGraceCycles = 0;
         boolean sampleJustEndedNaturally() { return naturalEndGraceCycles > 0; }
 
@@ -308,7 +324,6 @@ public class APU {
                 }
                 bytesRemaining = 0;
                 enableDelay = 0;
-                //Explicit disable also clears the natural-end grace window.
                 naturalEndGraceCycles = 0;
                 //Notify CPU to truncate/drop an already-scheduled DMC DMA halt.
                 if (cpu != null) cpu.cancelDmcDma();
@@ -349,10 +364,9 @@ public class APU {
                 } else {
                     //Opens the grace window a fresh $4015 re-enable can fuse with.
                     naturalEndGraceCycles = 3;
-                    //Implicit DMA Abort: same phantom 1-cycle DMA as the explicit case,
-                    //triggered by a non-looping sample's last byte landing (AccuracyCoin
-                    //"Implicit DMA Abort" keys 1/2). 3-cycle offset matches hardware
-                    //noticing the stop at the output cycle, not the fetch cycle.
+                    //Implicit DMA Abort: same phantom 1-cycle DMA as the explicit case, triggered by
+                    //a non-looping sample's last byte (AccuracyCoin "Implicit DMA Abort" keys 1/2).
+                    //The 3-cycle offset is hardware noticing the stop at the output cycle, not the fetch.
                     if (bitsRemaining == 0 && timerValue + 1 <= 2) abortedDmaDelay = 3;
                     if (irqEnable) {
                         irqFlag = true;
@@ -625,6 +639,27 @@ public class APU {
         outputCount = 0;
     }
 
+    //Reset button (nesdev "CPU power up state", after reset): registers keep their values but
+    //$4015 acts as if written $00, the triangle sequencer restarts at step 0, DMC output keeps
+    //only bit 0 and the frame counter restarts in its current mode (2A03E/G behaviour).
+    public void softReset() {
+        pulse1.enabled = false; pulse1.lengthCounter = 0;
+        pulse2.enabled = false; pulse2.lengthCounter = 0;
+        triangle.enabled = false; triangle.lengthCounter = 0;
+        triangle.sequencePos = 0;
+        noise.enabled = false; noise.lengthCounter = 0;
+        dmc.writeEnableFlag(false);
+        dmc.irqFlag = false;
+        dmc.outputLevel &= 1;
+        frameIrqFlag = false;
+        frameIrqClearAfterCycle = -1;
+        frameIrqAssertPending = false;
+        frameCycle = 0;
+        resetDelay = 0;
+        apuCycleToggle = false;
+        updateIrqLine();
+    }
+
     //-----------------------------------------------------------------
     // Frame sequencer
     //-----------------------------------------------------------------
@@ -666,7 +701,6 @@ public class APU {
     //"Frame Counter IRQ" tests N/O).
     private boolean frameIrqAssertPending = false;
 
-    //Advances every part of the APU by one CPU cycle.
     public void clock() {
         //Deferred $4015 IRQ-flag clear, on the first "get" cycle after the read.
         if (frameIrqClearAfterCycle >= 0 && cpu != null
@@ -704,13 +738,34 @@ public class APU {
 
         outputAccum += getOutputSample();
         outputCount++;
-        sampleCycleAccumulator += SAMPLE_HZ;
+        sampleCycleAccumulator += outputSampleHz;
         if (sampleCycleAccumulator >= CPU_HZ) {
             sampleCycleAccumulator -= CPU_HZ;
-            if (audioPlayer != null) audioPlayer.writeSample(outputAccum / outputCount);
+            if (audioPlayer != null) {
+                audioPlayer.writeSample(outputAccum / outputCount);
+                if (++samplesSinceRateCheck >= RATE_CHECK_INTERVAL) {
+                    samplesSinceRateCheck = 0;
+                    adjustOutputRate();
+                }
+            }
             outputAccum = 0;
             outputCount = 0;
         }
+    }
+
+    //Proportional control on a smoothed queue depth. Samples arrive in per-frame bursts,
+    //so the raw depth swings by a frame's worth; the moving average keeps the rate
+    //from wobbling with it (a 1% pitch shift is inaudible, a fast-moving one isn't).
+    private void adjustOutputRate() {
+        int queued = audioPlayer.getQueuedSamples();
+        if (queued < 0) { outputSampleHz = SAMPLE_HZ; queuedAverage = -1; return; }
+        if (queuedAverage < 0) queuedAverage = queued;
+        else queuedAverage += (queued - queuedAverage) * 0.05;
+        double target = AudioPlayer.TARGET_QUEUE_SAMPLES;
+        double error = (target - queuedAverage) / target;
+        if (error > 1) error = 1;
+        if (error < -1) error = -1;
+        outputSampleHz = SAMPLE_HZ * (1.0 + MAX_RATE_ADJUST * error);
     }
 
     private void stepFrameSequencer() {
@@ -866,6 +921,6 @@ public class APU {
         double tndOut = (t == 0 && n == 0 && d == 0) ? 0.0
                 : 159.79 / (1.0 / ((t / 8227.0) + (n / 12241.0) + (d / 22638.0)) + 100.0);
 
-        return pulseOut + tndOut;
+        return pulseOut + tndOut + (bus != null ? bus.expansionAudio() : 0.0);
     }
 }

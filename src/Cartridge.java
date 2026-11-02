@@ -1,287 +1,269 @@
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 
+//A loaded .nes image: parses the iNES/NES 2.0 header, sizes ROM/RAM the way the real board
+//populates them, picks the Mapper, and fronts it for the Bus/PPU/debuggers.
 public class Cartridge {
-    //How the 4 logical 1KB nametables ($2000/$2400/$2800/$2C00) fold onto the
-    //physical VRAM the PPU actually has. MMC3 (and similar mappers) can change this
-    //at any time via a mapper register write, which is why it lives per-cartridge
-    //instead of being a fixed fact decided once at load time.
+    //How the four logical 1KB nametables fold onto physical VRAM; many boards change it at
+    //runtime via a register write, so it lives per-cartridge.
     public enum MirrorMode { HORIZONTAL, VERTICAL, SINGLE_SCREEN_LOW, SINGLE_SCREEN_HIGH, FOUR_SCREEN }
 
-    private byte[] prgMemory;
-    private byte[] chrMemory;
-    private final byte[] prgRam = new byte[8192]; //$6000-$7FFF, used by mapper 4 boards with battery/work RAM
+    final byte[] prgRom;
+    final byte[] chrMem;      //CHR ROM, or CHR RAM when chrIsRam
+    final boolean chrIsRam;
+    final byte[] prgRam;      //work/save RAM at $6000-$7FFF (and wherever the board banks it)
+    final boolean battery;
+    final int mapperID;
+    final int submapper;
+    final boolean nes20;
+    final boolean fourScreen;
+    private final boolean headerMirrorHorizontal;
 
-    private int mapperID = 0;
-    private int prgBanks = 0; //16KB units, from the iNES header
-    private int chrBanks = 0; //8KB units, from the iNES header
-    private boolean headerMirrorHorizontal = false;
-    private boolean fourScreen = false;
-    private MirrorMode mirrorMode = MirrorMode.VERTICAL;
-
+    private final Mapper mapper;
     private CPU cpu;
-    public void connectCPU(CPU cpu) { this.cpu = cpu; }
-
-    //---- Mapper 4 (MMC3) register state -----------------------------------------
-    //$8000: low 3 bits pick which of R0-R7 the next $8001 write targets, bit 6
-    //picks the PRG bank-swap layout, bit 7 picks the CHR bank-swap layout.
-    private int bankSelect = 0;
-    private final int[] bankRegs = new int[8]; //R0-R7, raw values as last written
-    private boolean prgRamEnabled = true;
-    private boolean prgRamWriteProtect = false;
-    private int irqLatch = 0;
-    private int irqCounter = 0;
-    private boolean irqReloadFlag = false;
-    private boolean irqEnabled = false;
 
     public Cartridge(File file) throws IOException {
+        byte[] header = new byte[16];
         try (FileInputStream fis = new FileInputStream(file)) {
-            byte[] header = new byte[16];
-            if (fis.read(header) != 16) {
-                throw new IOException("Invalid iNES ROM file (header too short)");
-            }
-
-            //Verify "NES<EOF>" signature
+            if (fis.read(header) != 16) throw new IOException("Invalid iNES ROM file (header too short)");
             if (header[0] != 'N' || header[1] != 'E' || header[2] != 'S' || header[3] != 0x1A) {
                 throw new IOException("Not a valid iNES ROM file header");
             }
 
-            prgBanks = header[4] & 0xFF; //16KB units
-            chrBanks = header[5] & 0xFF; //8KB units
-
             int flags6 = header[6] & 0xFF;
             int flags7 = header[7] & 0xFF;
+            nes20 = (flags7 & 0x0C) == 0x08;
+            //iNES 1.0 files written by old tools often carry junk in bytes 7-15
+            //("DiskDude!"); the convention is to trust only the low mapper nibble then.
+            boolean archaic = !nes20 && (header[12] != 0 || header[13] != 0 || header[14] != 0 || header[15] != 0);
 
-            mapperID = (flags7 & 0xF0) | (flags6 >> 4);
-            headerMirrorHorizontal = (flags6 & 0x01) == 0;
-            fourScreen = (flags6 & 0x08) != 0;
-
-            if (mapperID != 0 && mapperID != 4) {
-                throw new IOException("Unsupported mapper " + mapperID + " (only NROM/mapper 0 and MMC3/mapper 4 are supported)");
-            }
-
-            mirrorMode = fourScreen ? MirrorMode.FOUR_SCREEN
-                    : (headerMirrorHorizontal ? MirrorMode.HORIZONTAL : MirrorMode.VERTICAL);
-
-            //Skip trainer if present (512 bytes)
-            if ((flags6 & 0x04) != 0) {
-                fis.skip(512);
-            }
-
-            //Read PRG ROM
-            prgMemory = new byte[Math.max(prgBanks, 1) * 16384];
-            fis.read(prgMemory);
-
-            //Read CHR ROM or allocate CHR RAM
-            if (chrBanks == 0) {
-                chrMemory = new byte[8192];
+            int mapper = (flags6 >> 4);
+            int sub = 0;
+            long prgSize, chrSize;
+            int prgRamSize, chrRamSize;
+            if (nes20) {
+                mapper |= (flags7 & 0xF0) | ((header[8] & 0x0F) << 8);
+                sub = (header[8] & 0xF0) >> 4;
+                prgSize = nes20Size(header[4] & 0xFF, header[9] & 0x0F, 16384);
+                chrSize = nes20Size(header[5] & 0xFF, (header[9] & 0xF0) >> 4, 8192);
+                int prgRamShift = header[10] & 0x0F, prgNvShift = (header[10] & 0xF0) >> 4;
+                int chrRamShift = header[11] & 0x0F, chrNvShift = (header[11] & 0xF0) >> 4;
+                prgRamSize = Math.max(prgRamShift == 0 ? 0 : (64 << prgRamShift), prgNvShift == 0 ? 0 : (64 << prgNvShift));
+                chrRamSize = Math.max(chrRamShift == 0 ? 0 : (64 << chrRamShift), chrNvShift == 0 ? 0 : (64 << chrNvShift));
             } else {
-                chrMemory = new byte[chrBanks * 8192];
-                fis.read(chrMemory);
+                if (!archaic) mapper |= (flags7 & 0xF0);
+                prgSize = (long) (header[4] & 0xFF) * 16384;
+                chrSize = (long) (header[5] & 0xFF) * 8192;
+                prgRamSize = -1; //decided per board below
+                chrRamSize = -1;
             }
-        }
-    }
+            mapperID = mapper;
+            submapper = sub;
+            battery = (flags6 & 0x02) != 0;
+            fourScreen = (flags6 & 0x08) != 0;
+            headerMirrorHorizontal = (flags6 & 0x01) == 0;
 
-    private boolean isMmc3() { return mapperID == 4; }
-
-    public byte cpuRead(int address) {
-        if (isMmc3() && address >= 0x6000 && address <= 0x7FFF) {
-            return prgRamEnabled ? prgRam[address & 0x1FFF] : 0;
-        }
-        if (address >= 0x8000 && address <= 0xFFFF) {
-            if (isMmc3()) {
-                return prgMemory[prgIndex(address)];
+            if (!isSupported(mapperID)) {
+                throw new IOException("Unsupported mapper " + mapperID + " - supported boards: "
+                        + "NROM, SxROM/MMC1, UxROM, UN1ROM, CNROM, TxROM/MMC3, HKROM/MMC6, TxSROM, TQROM, DxROM, "
+                        + "ExROM/MMC5, AxROM, PxROM/MMC2, FxROM/MMC4, CPROM, BNROM/NINA-001, GxROM, NES-EVENT");
             }
-            int mappedAddr = address - 0x8000;
-            if (prgBanks == 1) { //16 PRG ROM mirrored ($8000-$BFFF and $C000-$FFFF)
-                mappedAddr &= 0x3FFF;
+
+            if ((flags6 & 0x04) != 0) fis.skip(512); //trainer
+
+            prgRom = new byte[(int) Math.max(prgSize, 16384)];
+            readFully(fis, prgRom, (int) Math.min(prgSize, prgRom.length));
+
+            if (chrSize == 0) {
+                chrIsRam = true;
+                if (chrRamSize <= 0) chrRamSize = defaultChrRamSize(mapperID);
+                chrMem = new byte[chrRamSize];
+            } else {
+                chrIsRam = false;
+                chrMem = new byte[(int) chrSize];
+                readFully(fis, chrMem, chrMem.length);
             }
-            return prgMemory[mappedAddr];
+
+            if (prgRamSize < 0) {
+                //iNES 1.0: byte 8 is the PRG RAM size in 8KB units, but 0 historically
+                //meant "8KB if the board has any", so fall back to what the board carries.
+                int b8 = archaic ? 0 : (header[8] & 0xFF);
+                prgRamSize = b8 != 0 ? b8 * 8192 : defaultPrgRamSize(mapperID, battery, chrIsRam);
+            }
+            prgRam = new byte[prgRamSize];
         }
-        return 0;
+
+        mapper = createMapper(mapperID, submapper);
+        mapper.init(this);
+        mapper.reset();
     }
 
-    public void cpuWrite(int address, byte data) {
-        if (!isMmc3()) return; //NROM PRG ROM is read-only, and has no PRG RAM
-
-        if (address >= 0x6000 && address <= 0x7FFF) {
-            if (prgRamEnabled && !prgRamWriteProtect) prgRam[address & 0x1FFF] = data;
-            return;
-        }
-        if (address < 0x8000 || address > 0xFFFF) return;
-
-        int val = data & 0xFF;
-        switch (address & 0xE001) {
-            case 0x8000:
-                bankSelect = val;
-                break;
-            case 0x8001:
-                bankRegs[bankSelect & 0x07] = val;
-                break;
-            case 0xA000:
-                if (!fourScreen) mirrorMode = (val & 0x01) != 0 ? MirrorMode.HORIZONTAL : MirrorMode.VERTICAL;
-                break;
-            case 0xA001:
-                prgRamEnabled = (val & 0x80) != 0;
-                prgRamWriteProtect = (val & 0x40) != 0;
-                break;
-            case 0xC000:
-                irqLatch = val;
-                break;
-            case 0xC001:
-                irqReloadFlag = true;
-                break;
-            case 0xE000:
-                irqEnabled = false;
-                if (cpu != null) cpu.clearMapperIRQ(); //writing here also acknowledges any pending IRQ
-                break;
-            case 0xE001:
-                irqEnabled = true;
-                break;
+    private static void readFully(FileInputStream fis, byte[] dst, int len) throws IOException {
+        int off = 0;
+        while (off < len) {
+            int n = fis.read(dst, off, len - off);
+            if (n < 0) break; //truncated image: leave the rest zero (like an unprogrammed ROM)
+            off += n;
         }
     }
 
-    //MMC3 8KB PRG bank layout: $A000-$BFFF is always R7; one of $8000/$C000 is R6
-    //and the other is fixed to the second-to-last bank (selected by bankSelect bit
-    //6); $E000-$FFFF is always fixed to the very last bank.
-    private int prgIndex(int address) {
-        int prg8kCount = Math.max(prgBanks, 1) * 2;
-        int offset = address - 0x8000;
-        int slot = offset >> 13;
-        int within = offset & 0x1FFF;
-        boolean swapMode = (bankSelect & 0x40) != 0;
-        int last = prg8kCount - 1;
-        int bank;
-        switch (slot) {
-            case 0: bank = swapMode ? (last - 1) : (bankRegs[6] & 0x3F); break;
-            case 1: bank = bankRegs[7] & 0x3F; break;
-            case 2: bank = swapMode ? (bankRegs[6] & 0x3F) : (last - 1); break;
-            default: bank = last; break;
+    //NES 2.0 ROM sizes: plain unit count, or (when the MSB nibble is $F) the
+    //exponent-multiplier form 2^E * (MM*2+1).
+    private static long nes20Size(int lsb, int msb, int unit) {
+        if (msb == 0x0F) {
+            int exp = lsb >> 2, mul = (lsb & 3) * 2 + 1;
+            return (1L << exp) * mul;
         }
-        bank = ((bank % prg8kCount) + prg8kCount) % prg8kCount;
-        return bank * 8192 + within;
+        return (long) ((msb << 8) | lsb) * unit;
     }
 
-    //MMC3 CHR bank layout: two 2KB windows (R0, R1) and four 1KB windows (R2-R5),
-    //with bankSelect bit 7 swapping which half of the $0000-$1FFF space gets the
-    //2KB windows vs the 1KB windows.
-    private int chrIndex(int address) {
-        int chr1kCount = Math.max(chrMemory.length / 1024, 1);
-        address &= 0x1FFF;
-        int seg = address >> 10; //0-7
-        if ((bankSelect & 0x80) != 0) seg ^= 0x04;
-        int oneKBank;
-        switch (seg) {
-            case 0: oneKBank = bankRegs[0] & 0xFE; break;
-            case 1: oneKBank = (bankRegs[0] & 0xFE) + 1; break;
-            case 2: oneKBank = bankRegs[1] & 0xFE; break;
-            case 3: oneKBank = (bankRegs[1] & 0xFE) + 1; break;
-            case 4: oneKBank = bankRegs[2]; break;
-            case 5: oneKBank = bankRegs[3]; break;
-            case 6: oneKBank = bankRegs[4]; break;
-            default: oneKBank = bankRegs[5]; break;
+    private static boolean isSupported(int id) {
+        switch (id) {
+            case 0: case 1: case 2: case 3: case 4: case 5: case 7: case 9: case 10: case 13:
+            case 34: case 66: case 94: case 105: case 118: case 119: case 155: case 180: case 185: case 206:
+                return true;
+            default: return false;
         }
-        oneKBank = ((oneKBank % chr1kCount) + chr1kCount) % chr1kCount;
-        return oneKBank * 1024 + (address & 0x3FF);
     }
 
-    public byte ppuRead(int address) {
-        if (address >= 0x0000 && address <= 0x1FFF) {
-            int idx = isMmc3() ? chrIndex(address) : (address & 0x1FFF);
-            return chrMemory[idx];
-        }
-        return 0;
+    private static int defaultChrRamSize(int mapperID) {
+        return mapperID == 13 ? 16384 : 8192; //CPROM carries 16KB; every other RAM board 8KB
     }
 
-    public void ppuWrite(int address, byte data) {
-        if (chrBanks != 0 || address < 0x0000 || address > 0x1FFF) return; //CHR ROM is read-only
-        int idx = isMmc3() ? chrIndex(address) : (address & 0x1FFF);
-        chrMemory[idx] = data; //Write to CHR RAM
+    //What the real board family carries when the header doesn't say
+    private static int defaultPrgRamSize(int mapperID, boolean battery, boolean chrIsRam) {
+        switch (mapperID) {
+            case 0: return battery ? 8192 : 0;           //Family BASIC is the only NROM with RAM
+            case 1: case 155: case 105: return 8192;     //SNROM/SKROM/SOROM-class default; NES 2.0 says when it's 32KB (SXROM)
+            case 4: case 118: return 8192;               //TKROM/TSROM/TLSROM; TGROM/TLROM leave it empty but 8KB is harmless
+            case 5: return 65536;                        //ExROM: without a header size, give every bank select something to hit
+            case 10: return 8192;                        //FxROM
+            case 34: return chrIsRam ? 0 : 8192;         //BNROM: none; NINA-001: 8KB
+            default: return 0;
+        }
     }
 
-    //Called on every real or approximated MMC3 A12 rising edge - see PPU's clockA12()
-    //(true edge tracking for CPU-side $2006/$2007 accesses) and step()'s cycle==257/321
-    //sites (a per-scanline approximation of A12 during actual rendering, since this PPU
-    //renders per-pixel rather than modeling every individual per-dot pattern fetch).
-    public void clockMapperIRQ() {
-        if (!isMmc3()) return;
-        if (irqCounter == 0 || irqReloadFlag) {
-            irqCounter = irqLatch;
-            irqReloadFlag = false;
-        } else {
-            irqCounter--;
-        }
-        if (irqCounter == 0 && irqEnabled && cpu != null) {
-            cpu.raiseMapperIRQ();
+    private static Mapper createMapper(int id, int sub) {
+        switch (id) {
+            case 0: return new MapperNROM();
+            case 1: case 155: return new MapperMMC1(id == 155);
+            case 2: case 94: case 180: return new MapperUxROM(id);
+            case 3: case 185: return new MapperCNROM(id == 185);
+            case 4: case 118: case 119: case 206: return new MapperMMC3(id);
+            case 5: return new MapperMMC5();
+            case 7: return new MapperAxROM();
+            case 9: case 10: return new MapperMMC2(id == 10);
+            case 13: return new MapperCPROM();
+            case 34: return new MapperBNROM();
+            case 66: return new MapperGxROM();
+            case 105: return new MapperEvent();
+            default: throw new IllegalArgumentException("mapper " + id);
         }
     }
+
+    MirrorMode headerMirroring() {
+        return fourScreen ? MirrorMode.FOUR_SCREEN : (headerMirrorHorizontal ? MirrorMode.HORIZONTAL : MirrorMode.VERTICAL);
+    }
+
+    public void connectCPU(CPU cpu) {
+        this.cpu = cpu;
+        mapper.connectCPU(cpu);
+    }
+
+    //---- CPU bus ($4020-$FFFF). -1 = open bus. --------------------------------------
+    public int cpuRead(int address) { return mapper.cpuRead(address & 0xFFFF); }
+    public int cpuPeek(int address) { return mapper.cpuPeek(address & 0xFFFF); }
+    public void cpuWrite(int address, int data) { mapper.cpuWrite(address & 0xFFFF, data & 0xFF); }
+    public void cpuBusSnoop(int address, int data) { mapper.cpuBusSnoop(address & 0xFFFF, data & 0xFF); }
+    public void cpuClock() { mapper.cpuClock(); }
+
+    //---- PPU bus -------------------------------------------------------------------
+    public byte ppuRead(int address) { return (byte) mapper.chrRead(address & 0x1FFF); }
+    public byte ppuPeek(int address) { return (byte) mapper.chrPeek(address & 0x1FFF); }
+    public void ppuWrite(int address, byte data) { mapper.chrWrite(address & 0x1FFF, data & 0xFF); }
+    public byte ntRead(int address, byte[] ciram) { return (byte) mapper.ntRead(address & 0x2FFF, ciram); }
+    public byte ntPeek(int address, byte[] ciram) { return (byte) mapper.ntPeek(address & 0x2FFF, ciram); }
+    public void ntWrite(int address, byte data, byte[] ciram) { mapper.ntWrite(address & 0x2FFF, data & 0xFF, ciram); }
+
+    //Called on every real or approximated PPU A12 rising edge: PPU.clockA12() tracks true edges
+    //for $2006/$2007 accesses, step()'s cycle 257/321 sites approximate it per scanline.
+    public void clockMapperIRQ() { mapper.ppuA12Rise(); }
+
+    public double audioOutput() { return mapper.audioOutput(); }
 
     public boolean isMirrorHorizontal() { return headerMirrorHorizontal; }
-    public MirrorMode getMirrorMode() { return mirrorMode; }
+    public MirrorMode getMirrorMode() { return mapper.mirrorMode(); }
     public int getMapperID() { return mapperID; }
+    public int getSubmapper() { return submapper; }
+    public String getBoardName() { return mapper.name(); }
+    public boolean hasChrRam() { return chrIsRam; }
+    public boolean hasPrgRam() { return prgRam.length > 0; }
+    public int getPrgRamSize() { return prgRam.length; }
 
-    //Clears CHR RAM (if the cartridge has any) and PRG RAM, and resets mapper
-    //register state, back to power-on zeroes. Used only by the TAS Maker's
-    //replay-from-power-on seeking, so repeated replays of the same input log are
-    //fully deterministic instead of depending on whatever a previous replay left in
-    //RAM/mapper state.
-    public void hardReset() {
-        if (chrBanks == 0) java.util.Arrays.fill(chrMemory, (byte) 0);
-        java.util.Arrays.fill(prgRam, (byte) 0);
-        bankSelect = 0;
-        java.util.Arrays.fill(bankRegs, 0);
-        prgRamEnabled = true;
-        prgRamWriteProtect = false;
-        irqLatch = 0;
-        irqCounter = 0;
-        irqReloadFlag = false;
-        irqEnabled = false;
-        mirrorMode = fourScreen ? MirrorMode.FOUR_SCREEN
-                : (headerMirrorHorizontal ? MirrorMode.HORIZONTAL : MirrorMode.VERTICAL);
+    //Precise Tracing bank display: the 8KB PRG bank behind each of the four CPU slots and the
+    //1KB CHR bank behind each of the eight PPU slots.
+    public int getPrgBankCount8k() { return Math.max(prgRom.length / 8192, 1); }
+    public int getChrBankCount1k() { return Math.max(chrMem.length / 1024, 1); }
+    public int[] debugPrgBanks() { return mapper.debugPrgBanks(); }
+    public int[] debugChrBanks() { return mapper.debugChrBanks(); }
+    public String[] debugPrgNotes() { return mapper.debugPrgNotes(); }
+    public String describeWrite(int address, int data) { return mapper.describeWrite(address & 0xFFFF, data & 0xFF); }
+    public String describeState() { return mapper.describeState(); }
+
+    public String describeHeader() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Mapper ").append(mapperID);
+        if (nes20) sb.append('.').append(submapper);
+        sb.append(" (").append(mapper.name()).append(")");
+        sb.append(nes20 ? ", NES 2.0 header" : ", iNES header");
+        sb.append(String.format("%nPRG ROM %dKB, CHR %s %dKB, PRG RAM %dKB%s%s",
+                prgRom.length / 1024, chrIsRam ? "RAM" : "ROM", chrMem.length / 1024, prgRam.length / 1024,
+                battery ? " (battery)" : "", fourScreen ? ", four-screen VRAM" : ""));
+        return sb.toString();
     }
 
-    //TAS Maker greenzone checkpoint support. prgMemory/mapperID/prgBanks/chrBanks/
-    //headerMirrorHorizontal/fourScreen are never mutated after load, so only CHR RAM,
-    //PRG RAM, and the mapper's own register state (bank selects, IRQ counter,
-    //current mirror mode) need capturing.
+    //Back to power-on (CHR RAM, PRG RAM, mapper registers); used by TAS Maker
+    //replay-from-power-on so repeated replays of one input log are deterministic.
+    public void hardReset() {
+        if (chrIsRam) java.util.Arrays.fill(chrMem, (byte) 0);
+        Bus.fillPowerOnPattern(prgRam); //same SRAM boot pattern as the console's work RAM
+        mapper.reset();
+    }
+
+    //TAS Maker greenzone checkpoint: ROM and header never change, so only CHR RAM, PRG RAM
+    //and the mapper's own serialized registers are captured.
     public static final class State {
-        byte[] chr, prgRam;
-        int bankSelect;
-        int[] bankRegs;
-        boolean prgRamEnabled, prgRamWriteProtect;
-        int irqLatch, irqCounter;
-        boolean irqReloadFlag, irqEnabled;
-        MirrorMode mirrorMode;
+        byte[] chrRam, prgRam, mapper;
     }
 
     public State snapshot() {
         State s = new State();
-        s.chr = chrMemory.clone();
+        s.chrRam = chrIsRam ? chrMem.clone() : null;
         s.prgRam = prgRam.clone();
-        s.bankSelect = bankSelect;
-        s.bankRegs = bankRegs.clone();
-        s.prgRamEnabled = prgRamEnabled;
-        s.prgRamWriteProtect = prgRamWriteProtect;
-        s.irqLatch = irqLatch;
-        s.irqCounter = irqCounter;
-        s.irqReloadFlag = irqReloadFlag;
-        s.irqEnabled = irqEnabled;
-        s.mirrorMode = mirrorMode;
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(256);
+            DataOutputStream out = new DataOutputStream(bos);
+            mapper.saveState(out);
+            out.flush();
+            s.mapper = bos.toByteArray();
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
         return s;
     }
 
     public void restore(State s) {
-        System.arraycopy(s.chr, 0, chrMemory, 0, chrMemory.length);
+        if (chrIsRam && s.chrRam != null) System.arraycopy(s.chrRam, 0, chrMem, 0, chrMem.length);
         System.arraycopy(s.prgRam, 0, prgRam, 0, prgRam.length);
-        bankSelect = s.bankSelect;
-        System.arraycopy(s.bankRegs, 0, bankRegs, 0, bankRegs.length);
-        prgRamEnabled = s.prgRamEnabled;
-        prgRamWriteProtect = s.prgRamWriteProtect;
-        irqLatch = s.irqLatch;
-        irqCounter = s.irqCounter;
-        irqReloadFlag = s.irqReloadFlag;
-        irqEnabled = s.irqEnabled;
-        mirrorMode = s.mirrorMode;
+        try {
+            mapper.loadState(new DataInputStream(new ByteArrayInputStream(s.mapper)));
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

@@ -2,6 +2,15 @@ public class Bus {
     //2KB Internal RAM ($0000-$07FF)
     private final byte[] ram = new byte[2048];
 
+    //Power-on RAM pattern "$00 $00 $00 $00 $FF $FF $FF $FF" repeating: the dominant pattern on
+    //real consoles and the one FCEUX uses, so .fm2 movies made there sync here.
+    public static void fillPowerOnPattern(byte[] mem) {
+        for (int i = 0; i < mem.length; i++) mem[i] = (i & 4) != 0 ? (byte) 0xFF : (byte) 0x00;
+    }
+
+    //Without a cartridge the reset vector reads open bus, so the emulator refuses to run.
+    public boolean hasCartridge() { return cartridge != null; }
+
     private CPU cpu;
     private final PPU ppu;
     private final APU apu;
@@ -14,9 +23,8 @@ public class Bus {
     private int controller2Shift = 0;
     private boolean controllerStrobe = false;
 
-    //Fired on each $4016 strobe rising edge (controllers begin reloading). Used by .r08 ACE-mode
-    //playback, which needs to advance to the next input pair on every individual strobe rather
-    //than once per frame - see NESEmulator's onR08ControllerStrobe().
+    //Fired on each $4016 strobe rising edge; .r08 ACE-mode playback advances to the next input
+    //pair per strobe rather than per frame (see NESEmulator's onR08ControllerStrobe()).
     public Runnable onControllerStrobe;
 
     //Set by a $4016 strobe write; consumed each frame by TAS Maker to detect lag frames
@@ -46,9 +54,11 @@ public class Bus {
     }
 
     public Bus(PPU ppu, APU apu) {
+        fillPowerOnPattern(ram);
         this.ppu = ppu;
         this.apu = apu;
         this.ppu.connectBus(this);
+        this.apu.connectBus(this);
     }
 
     public void connectCPU(CPU cpu) {
@@ -59,19 +69,23 @@ public class Bus {
         this.cartridge = cart;
     }
 
+    //Reset button: RAM, A/X/Y, PPU VRAM/OAM/palette and mapper state are left alone;
+    //the CPU re-runs its reset sequence, the PPU is held in reset and the APU is silenced.
     public void reset() {
         if (cpu != null) cpu.reset();
         if (ppu != null) ppu.reset();
+        if (apu != null) apu.softReset();
+        NESEmulator.currentFrame = 0;
     }
 
     //Full power-on reset (vs. soft reset() above); used by TAS Maker replay-from-power-on
     //so replays of the same input log land on identical state
     public void hardReset() {
-        if (cpu != null) cpu.reset();
+        if (cpu != null) cpu.powerOn();
         if (ppu != null) ppu.hardReset();
         if (apu != null) apu.reset();
         if (cartridge != null) cartridge.hardReset();
-        java.util.Arrays.fill(ram, (byte) 0);
+        fillPowerOnPattern(ram);
         //Re-pin Memory Inspector "Freeze"s so power cycle doesn't drop them
         for (java.util.Map.Entry<Integer, Byte> entry : frozenRam.entrySet()) ram[entry.getKey()] = entry.getValue();
         controller1 = 0;
@@ -80,10 +94,11 @@ public class Bus {
         controller2Shift = 0;
         strobedThisFrame = false;
         controllerStrobe = false;
+        NESEmulator.currentFrame = 0;
     }
 
     public byte cpuRead(int address) {
-        address &= 0xFFFF; //mask to 16-bit
+        address &= 0xFFFF;
 
         //1. Internal RAM, mirrored to $1FFF
         if (address >= 0x0000 && address <= 0x1FFF) {
@@ -119,12 +134,13 @@ public class Bus {
         else if (address >= 0x4000 && address <= 0x4015) {
             return apu.cpuRead(address);
         }
-        //6. Cartridge PRG RAM (MMC3 only) and PRG ROM; NROM has nothing here, falls to open bus
-        else if (address >= 0x6000 && address <= 0x7FFF) {
-            if (cartridge != null && cartridge.getMapperID() == 4) return cartridge.cpuRead(address);
-        }
-        else if (address >= 0x8000 && address <= 0xFFFF) {
-            if (cartridge != null) return cartridge.cpuRead(address);
+        //6. Cartridge space ($4020-$FFFF): the board answers -1 where it has no chip select
+        //   (NROM's $6000-$7FFF, an absent MMC5 RAM chip...), which falls to open bus.
+        else if (address >= 0x4020) {
+            if (cartridge != null) {
+                int v = cartridge.cpuRead(address);
+                if (v >= 0) return (byte) v;
+            }
         }
         //Anything unmapped is open bus: the floating CPU data bus
         return (byte) cpuOpenBus();
@@ -146,9 +162,11 @@ public class Bus {
             ram[ramAddr] = frozenValue != null ? frozenValue : data;
         }
 
-        //2. PPU Registers
+        //2. PPU Registers. The cartridge connector carries these writes too; the MMC5
+        //   snoops PPUCTRL/PPUMASK to learn the sprite size and whether rendering is on.
         else if (address >= 0x2000 && address <= 0x3FFF) {
             ppu.cpuWrite(0x2000 + (address & 0x0007), data);
+            if (cartridge != null) cartridge.cpuBusSnoop(address, data & 0xFF);
         }
 
         //3. OAM DMA: copies a 256-byte page into PPU OAM, stalling the CPU
@@ -162,12 +180,10 @@ public class Bus {
             //so TAS Maker can detect lag frames (AccuracyCoin "Controller Strobing" test 2)
             if ((data & 0x01) != 0) strobedThisFrame = true;
             boolean nowHigh = (data & 0x01) != 0;
-            //The strobe line just holds parallel-load asserted; actual latch happens on
-            //CPU "put" cycles during assertion. STA/STA holds ~6 cycles (always spans a
-            //put, always latches); DEC holds exactly 1 cycle, so whether it latches
-            //depends on put vs. get for that single cycle (AccuracyCoin tests 3 & 4).
-            //totalCycles isn't incremented yet for this write's own cycle, so an even
-            //value here means a put cycle.
+            //The strobe only asserts parallel-load; the latch happens on CPU "put" cycles, so STA/STA
+            //(~6 cycles) always latches while DEC's single cycle latches only if it is a put
+            //(AccuracyCoin tests 3 & 4). totalCycles isn't incremented yet for this write's cycle,
+            //so an even value here means a put cycle.
             if (nowHigh && !controllerStrobe) {
                 strobeHighSince = cpu.totalCycles;
                 if ((cpu.totalCycles & 1L) == 0) latchControllers();
@@ -185,7 +201,7 @@ public class Bus {
         }
         //6. Cartridge Space
         else if (address >= 0x4020 && address <= 0xFFFF) {
-            if (cartridge != null) cartridge.cpuWrite(address, data);
+            if (cartridge != null) cartridge.cpuWrite(address, data & 0xFF);
         }
     }
 
@@ -230,7 +246,11 @@ public class Bus {
         } else if (address >= 0x4000 && address <= 0x4015) {
             return apu.cpuRead(address);
         } else if (address >= 0x4020 && address <= 0xFFFF) {
-            if (cartridge != null) return cartridge.cpuRead(address);
+            if (cartridge != null) {
+                int v = cartridge.cpuPeek(address);
+                if (v >= 0) return (byte) v;
+            }
+            return (byte) cpuOpenBus();
         }
         return 0;
     }
@@ -278,6 +298,7 @@ public class Bus {
         strobedThisFrame = s.strobedThisFrame;
     }
 
+    //---- PPU bus -> cartridge connector ---------------------------------------------
     public byte ppuReadCartridge(int address) {
         if (cartridge != null) return cartridge.ppuRead(address);
         return 0;
@@ -287,12 +308,48 @@ public class Bus {
         if (cartridge != null) cartridge.ppuWrite(address, data);
     }
 
+    //Side-effect-free CHR read for debug viewers (MMC2/MMC4 latches and the MMC5 fetch
+    //watcher must not see inspector traffic)
+    public byte ppuPeekCartridge(int address) {
+        if (cartridge != null) return cartridge.ppuPeek(address);
+        return 0;
+    }
+
+    //Nametable space ($2000-$2FFF): the board routes the four logical tables onto the PPU's 4KB
+    //ciram (or its own RAM / fill logic); without a cartridge, vertical mirroring.
+    public byte ppuNtRead(int address, byte[] ciram) {
+        if (cartridge != null) return cartridge.ntRead(address, ciram);
+        return ciram[address & 0x7FF];
+    }
+    public byte ppuNtPeek(int address, byte[] ciram) {
+        if (cartridge != null) return cartridge.ntPeek(address, ciram);
+        return ciram[address & 0x7FF];
+    }
+    public void ppuNtWrite(int address, byte data, byte[] ciram) {
+        if (cartridge != null) cartridge.ntWrite(address, data, ciram);
+        else ciram[address & 0x7FF] = data;
+    }
+
+    public Cartridge getCartridge() { return cartridge; }
+
     public Cartridge.MirrorMode getMirrorMode() {
         return cartridge != null ? cartridge.getMirrorMode() : Cartridge.MirrorMode.VERTICAL;
     }
 
-    //Called once per scanline to drive a mapper's IRQ counter (currently MMC3 only)
+    //Called on every PPU A12 rising edge (real or approximated) to drive MMC3-style
+    //scanline counters
     public void clockMapperIRQ() {
         if (cartridge != null) cartridge.clockMapperIRQ();
+    }
+
+    //One CPU cycle elapsed (called by the CPU core on every cycle it completes); boards
+    //with cycle-counting timers or expansion audio advance here
+    public void cpuCycle() {
+        if (cartridge != null) cartridge.cpuClock();
+    }
+
+    //Expansion audio from the board, summed into the APU mixer
+    public double expansionAudio() {
+        return cartridge != null ? cartridge.audioOutput() : 0.0;
     }
 }

@@ -9,6 +9,9 @@ import java.awt.event.ComponentEvent;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.io.File;
+import java.io.FileInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -17,6 +20,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 public class NESEmulator extends JFrame implements Runnable {
 
     private final NESDisplayPanel displayPanel;
@@ -58,6 +69,14 @@ public class NESEmulator extends JFrame implements Runnable {
     private NametableViewerDialog nametableViewerDialog;
     private PPUInspectorDialog ppuInspectorDialog;
 
+    //Precise Tracing (Tools menu): replays the TAS Maker's next frame one CPU cycle at a time; while it runs the
+    //TAS Maker's own frame advance/seek is locked out so the traced frame lands in the timeline exactly like a Play
+    //frame (see PreciseTraceDialog.Host and the preciseTraceActive guards below).
+    private PreciseTraceDialog preciseTraceDialog;
+    private volatile boolean preciseTraceActive = false;
+    private int preciseTraceRow = 0;
+    private long preciseTraceStartCycle = 0;
+
     //TAS Maker window components
     private JDialog tasDialog;
     private JTable tasTable;
@@ -65,34 +84,25 @@ public class NESEmulator extends JFrame implements Runnable {
     private JToggleButton tasPlayButton;
     //While TAS Maker is open it owns controller 1 and frame advancement; run()'s loop must not also step.
     private volatile boolean tasActive = false;
-    //Guards every mutation of cpu/ppu/bus state. The background "NES-MainLoop" thread (run()) and
-    //EDT-driven operations (TAS Maker's hardReset()/tasAdvanceOneFrame()/seekToFrame(), Power
-    //Cycle, Reset, ROM load) all touch the same emulator instance with no other coordination -
-    //tasActive/paused are only rechecked once per outer frame loop iteration, so without this lock
-    //the background thread can still be mid-updateEmulationFrame() (a whole frame's worth of CPU/PPU
-    //stepping) when the EDT concurrently calls bus.hardReset(), letting an extra frame's state bleed
-    //into what should be a clean power-on - a real data race, not just a labeling bug, and the
-    //likely source of TAS Maker's "row 0 isn't really frame 0" reports.
+    //Guards every mutation of cpu/ppu/bus state: the "NES-MainLoop" thread (run()) and EDT operations (TAS Maker,
+    //Power Cycle, Reset, ROM load) share one emulator instance, and tasActive/paused are only rechecked once per frame.
+    //Without it the EDT's bus.hardReset() can land mid-updateEmulationFrame() and bleed an extra frame into a "clean" power-on.
     private final Object emulationLock = new Object();
     private boolean tasPlaying = false;
     private javax.swing.Timer tasPlayTimer;
-    //Recorded/edited per-frame controller 1 bitmask (LSB-first A/B/Select/Start/Up/Down/Left/Right).
-    //Frame k's poll reads tasInputs.get(k-1) (one-frame latency; frame 0 sees nothing). This is the
-    //movie - there's no other savestate notion, seeking replays this list from power-on.
+    //Recorded per-frame controller 1 bitmask (LSB-first A/B/Select/Start/Up/Down/Left/Right); frame k polls
+    //tasInputs.get(k-1), so frame 0 sees nothing. This list is the movie - seeking replays it from power-on.
     private final List<Integer> tasInputs = new ArrayList<>();
     //Frames already executed against the live state; shown row is tasFrame - 1.
     private int tasFrame = 0;
-    //How many frames (from 0) have an up-to-date "savestate" matching current tasInputs.
-    //Rows below this are colored green/red (see tasRowColor); rows at/after are plain.
-    //Only editing an input shrinks this - seeking never does.
+    //Number of frames (from 0) whose state matches current tasInputs; rows below are colored green/red (tasRowColor),
+    //rows at/after are plain. Only editing an input shrinks this - seeking never does.
     private int tasValidFrontier = 0;
     //Parallel to tasInputs: whether controller 1 was strobed that frame (see Bus.consumeStrobedThisFrame).
     //Validated+unstrobed = "lag frame", surfaced by the red/green coloring.
     private final List<Boolean> tasFrameStrobed = new ArrayList<>();
-    //Greenzone checkpoints: full emulator snapshots keyed by executed frame count, on a fixed grid
-    //(0, N, 2N, ... where N = tasSavestateInterval) so seekToFrame can restore the nearest one instead
-    //of always replaying from power-on. TreeMap for cheap floorKey lookups. Frame 0 needs no entry -
-    //bus.hardReset() covers it. See maybeCaptureTasCheckpoint / invalidateTasCheckpointsFrom.
+    //Greenzone checkpoints keyed by executed frame count on a grid of tasSavestateInterval (0, N, 2N...) so seekToFrame
+    //restores the nearest floorKey entry instead of replaying from power-on. Frame 0 needs no entry - bus.hardReset() covers it.
     private final TreeMap<Integer, TasCheckpoint> tasCheckpoints = new TreeMap<>();
     //Pairs a state checkpoint with the on-screen pixels at that instant - the framebuffer lives in
     //NESDisplayPanel, not the PPU, so it must be captured/restored alongside the state.
@@ -117,18 +127,15 @@ public class NESEmulator extends JFrame implements Runnable {
     private List<Integer> tasClipboard = null;
     private JPopupMenu tasContextMenu;
 
-    //"Play Movie": plays a saved .tas file back in real time (Emulation menu) without opening the
-    //TAS editor - equivalent to opening the editor, seeking to frame 0, and hitting Play. Reuses
-    //the same array semantics as tasInputs (index 0 = row 0 = hardware's pre-execution power-on
-    //state; frame k's bits come from index k-1). Runs entirely inside run()'s real-time loop.
-    //Mutually exclusive with r08 playback - starting either clears the other.
+    //"Play Movie": real-time playback of a saved .tas without opening the TAS editor, using tasInputs' array semantics
+    //(index 0 = power-on row, frame k reads index k-1) inside run()'s loop. Mutually exclusive with r08 playback - starting
+    //either clears the other.
     private List<Integer> playMovieInputs = null;
     private int playMovieFrame = 1; //mirrors tasFrame: starts at 1 (row 0 free via hardReset())
 
-    //".r08" replay-device format playback (Emulation menu): raw bytes, one (P1, P2) byte pair per
-    //frame, MSB-first bit order (A=0x80 ... Right=0x01) - the reverse of this emulator's internal
-    //LSB-first order, so bits are reversed via reverseByte() before being applied. See
-    //applyR08CurrentPair()/onR08ControllerStrobe() for the per-frame vs. per-strobe advance modes.
+    //.r08 replay-device playback: one (P1, P2) byte pair per frame, MSB-first (A=0x80 down to Right=0x01), the reverse of the
+    //internal LSB-first order, so bits go through reverseByte(). See applyR08CurrentPair()/onR08ControllerStrobe() for
+    //per-frame vs. per-strobe advance.
     private byte[] r08Data = null;
     private int r08PairIndex = 0;
     private long r08FrameCount = 0; //1-indexed count of frames processed since playback started
@@ -139,20 +146,38 @@ public class NESEmulator extends JFrame implements Runnable {
     private boolean r08TransitionEnabled = false;
     private int r08TransitionFrame = 0;
     private JDialog r08Dialog;
+    private JDialog r08ConvertDialog;
     private JCheckBox r08AceModeCheckbox;
     private JCheckBox r08TransitionCheckbox;
     private JTextField r08TransitionField;
 
+    private int lastNonLagFrame;
+    private StringBuilder inputlog = new StringBuilder();
+
+    private JComboBox<String> formatBox = new JComboBox();
+    private boolean formatBizhawk;
+    private boolean converting = false;
+    public static int currentFrame;
+    private static String SHA1 = "null";
+    private static String RomMd5Base64 = ""; //FCEUX-style MD5 of PRG+CHR (no header), base64
+    private static String RomName = "null";
+
     public NESEmulator() {
         super("NESEmulator");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setResizable(false);
+        //Resizable so the maximize button is enabled (the display panel letterboxes any size); maximizing is
+        //treated as "go full screen" (see setFullScreen and the window state listener below).
+        setMinimumSize(new Dimension(NESDisplayPanel.VIEW_WIDTH, NESDisplayPanel.VIEW_HEIGHT));
+        addWindowStateListener(e -> {
+            if (!fullScreen && (e.getNewState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH) {
+                SwingUtilities.invokeLater(() -> setFullScreen(true));
+            }
+        });
 
         //Set once here - AWT walks the owner chain, so every owned JDialog inherits this icon.
         ImageIcon appIcon = new ImageIcon("res/logo.png");
         if (appIcon.getIconWidth() > 0) setIconImage(appIcon.getImage());
 
-        //Initialize hardware
         ppu = new PPU();
         apu = new APU();
         bus = new Bus(ppu, apu);
@@ -185,6 +210,84 @@ public class NESEmulator extends JFrame implements Runnable {
         createTASMakerWindow();
         createControllerSetupDialog();
         setupController();
+        preciseTraceDialog = new PreciseTraceDialog(this, cpu, ppu, bus, displayPanel, new PreciseTraceHost());
+    }
+
+    //Bridges the Precise Tracing window to the TAS Maker's frame bookkeeping: tasAdvanceOneFrame() split into
+    //begin / per-cycle / finish so the trace thread can step and narrate the cycles in between.
+    private final class PreciseTraceHost implements PreciseTraceDialog.Host {
+        private boolean grew = false;
+
+        @Override public boolean isTasActive() { return tasActive; }
+        @Override public Object emulationLock() { return emulationLock; }
+
+        @Override public String beginTracedFrame() {
+            setTasPlaying(false);
+            audioPlayer.setMuted(true); //never audible: this is a slowed-down seek, not Play
+            grew = tasFrame >= tasInputs.size();
+            if (grew) tasInputs.add(0);
+            int bits = tasInputs.get(tasFrame - 1);
+            preciseTraceRow = tasFrame;
+            synchronized (emulationLock) {
+                setController1Tracked(bits);
+                frameTraceBuffer.setLength(0);
+                preciseTraceStartCycle = cpu.totalCycles;
+            }
+            preciseTraceActive = true;
+            if (grew) tasTableModel.fireTableRowsInserted(preciseTraceRow, preciseTraceRow);
+            return "TAS row " + preciseTraceRow;
+        }
+
+        @Override public boolean runTracedCycle() {
+            //Same ordering as updateEmulationFrame()'s loop body.
+            apu.clock();
+            cpu.step(frameTraceBuffer, ppu, tracingEnabled);
+            ppu.step();
+            ppu.step();
+            ppu.step();
+            return ppu.consumeVBlankStart();
+        }
+
+        @Override public void finishTracedFrame() {
+            synchronized (emulationLock) {
+                afterFrameEmulated("TAS row " + preciseTraceRow + " (Precise Trace)", preciseTraceStartCycle);
+                recordFrameStrobe(preciseTraceRow);
+                tasFrame++;
+                if (tasFrame > tasValidFrontier) tasValidFrontier = tasFrame;
+                maybeCaptureTasCheckpoint(tasFrame);
+            }
+            preciseTraceActive = false;
+            renderFrameWithOverlay();
+            tasTableModel.fireTableRowsUpdated(preciseTraceRow, preciseTraceRow);
+            syncTasSelection();
+            tasTable.repaint();
+        }
+    }
+
+    private void openPreciseTracing() {
+        preciseTraceDialog.refreshAvailability();
+        preciseTraceDialog.setVisible(true);
+        preciseTraceDialog.toFront();
+    }
+
+    //True once a ROM is open; without a cartridge the CPU would execute open bus, so every path
+    //that steps the machine is gated on this.
+    private boolean romLoaded() { return bus.hasCartridge(); }
+
+    //Gate for user-initiated emulation actions: explains why nothing happened.
+    private boolean requireRom() {
+        if (romLoaded()) return true;
+        JOptionPane.showMessageDialog(this, "No ROM loaded. Open a ROM first (Emulation > Open ROM...).",
+                "No ROM", JOptionPane.INFORMATION_MESSAGE);
+        return false;
+    }
+
+    //True (with a message) if an operation must wait for the running precise trace.
+    private boolean blockedByPreciseTrace() {
+        if (!preciseTraceActive) return false;
+        JOptionPane.showMessageDialog(this, "A Precise Trace is running. Finish it (or use \"Finish Frame Instantly\") first.",
+                "Precise Tracing active", JOptionPane.INFORMATION_MESSAGE);
+        return true;
     }
 
     //Bit order matches Bus's shift-out order (LSB first): A,B,Select,Start,Up,Down,Left,Right.
@@ -205,6 +308,11 @@ public class NESEmulator extends JFrame implements Runnable {
     private final Map<String, JButton> keybindButtons = new LinkedHashMap<>();
     private JDialog controllerDialog;
     private JCheckBox allowDpadConflictsCheckbox;
+    private JCheckBox showInputOverlayCheckbox;
+    //Last controller-1 byte applied to the bus (setController1Tracked), fed to the input overlay before each
+    //renderFrame() so a frame with several mid-frame strobes (.r08 ACE mode) shows only the last combination pressed.
+    private int lastControllerOverlayBits = 0;
+    private int lastController2OverlayBits = 0;
     //When false (default), only the most recently pressed key of each opposing D-pad
     //pair takes effect (real controllers can't hold both); see udPressOrder/lrPressOrder.
     private boolean allowDpadConflicts = false;
@@ -216,8 +324,73 @@ public class NESEmulator extends JFrame implements Runnable {
     private final List<Integer> udPressOrder = new ArrayList<>();
     private final List<Integer> lrPressOrder = new ArrayList<>();
 
+    //Full screen: the frame goes undecorated, loses its menu bar and is stretched over its current monitor; the
+    //display panel letterboxes the 256x240 picture itself (NESDisplayPanel.getImageBounds).
+    private boolean fullScreen = false;
+    private JMenuBar windowedMenuBar;
+    private Rectangle windowedBounds;
+
+    public boolean isFullScreen() {
+        return fullScreen;
+    }
+
+    private void toggleFullScreen() {
+        setFullScreen(!fullScreen);
+    }
+
+    private void setFullScreen(boolean enable) {
+        if (enable == fullScreen) return;
+        fullScreen = enable;
+
+        //Changing decorations requires the native window to be rebuilt, which dispose()
+        //also does to every owned dialog - remember which ones were open and re-show them.
+        Rectangle screenBounds = getGraphicsConfiguration().getBounds();
+        List<Window> openDialogs = new ArrayList<>();
+        for (Window w : getOwnedWindows()) if (w.isVisible()) openDialogs.add(w);
+
+        //Entered via the maximize button: the bounds now are the maximized ones, so keep the
+        //last plain-window bounds we saved instead.
+        boolean maximized = (getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
+        if (enable && !maximized) windowedBounds = getBounds();
+
+        dispose();
+        setExtendedState(Frame.NORMAL);
+        if (enable) {
+            windowedMenuBar = getJMenuBar();
+            setJMenuBar(null);
+            setUndecorated(true);
+            setBounds(screenBounds);
+        } else {
+            setUndecorated(false);
+            setJMenuBar(windowedMenuBar);
+            if (windowedBounds != null) {
+                setBounds(windowedBounds);
+            } else {
+                pack();
+                setLocationRelativeTo(null);
+            }
+        }
+        setVisible(true);
+        for (Window w : openDialogs) w.setVisible(true);
+        toFront();
+        displayPanel.requestFocusInWindow();
+    }
+
     private void setupController() {
         for (int i = 0; i < BUTTON_NAMES.length; i++) keyBindings.put(BUTTON_NAMES[i], DEFAULT_KEYS[i]);
+
+        //F11 toggles full screen; Escape leaves it. Bound on the panel (not as menu accelerators)
+        //because the menu bar is removed while full screen.
+        InputMap im = displayPanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        ActionMap am = displayPanel.getActionMap();
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_F11, 0), "toggleFullScreen");
+        am.put("toggleFullScreen", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) { toggleFullScreen(); }
+        });
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "exitFullScreen");
+        am.put("exitFullScreen", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) { setFullScreen(false); }
+        });
 
         displayPanel.setFocusable(true);
         displayPanel.requestFocusInWindow();
@@ -252,6 +425,26 @@ public class NESEmulator extends JFrame implements Runnable {
         return null;
     }
 
+    //Wraps setController1Tracked() so the input overlay always knows the last controller-1 state
+    //actually applied, including intermediate mid-frame strobes.
+    private void setController1Tracked(int bits) {
+        lastControllerOverlayBits = bits;
+        bus.setController1(bits);
+    }
+
+    //Wraps setController2Tracked() the same way as setController1Tracked(), for the overlay's P2 half.
+    private void setController2Tracked(int bits) {
+        lastController2OverlayBits = bits;
+        bus.setController2(bits);
+    }
+
+    //Feeds this frame's final controller states to the display panel's overlay and renders it -
+    //use in place of a bare displayPanel.renderFrame() call.
+    private void renderFrameWithOverlay() {
+        displayPanel.setOverlayBits(lastControllerOverlayBits, lastController2OverlayBits);
+        displayPanel.renderFrame();
+    }
+
     private int bitForButton(String name) {
         for (int i = 0; i < BUTTON_NAMES.length; i++) if (BUTTON_NAMES[i].equals(name)) return BUTTON_BITS[i];
         return 0;
@@ -278,7 +471,7 @@ public class NESEmulator extends JFrame implements Runnable {
         if (paused) queuedInputBits |= pressedNew;
         //Movie/r08 playback owns controller1 while active (applyPlaybackInputsForFrame() sets it
         //each frame) - a keypress here would otherwise stomp on the current frame's playback input.
-        if (!tasActive && playMovieInputs == null && r08Data == null) bus.setController1(controller1Bits | queuedInputBits);
+        if (!tasActive && playMovieInputs == null && r08Data == null) setController1Tracked(controller1Bits | queuedInputBits);
     }
 
     private void createControllerSetupDialog() {
@@ -298,11 +491,15 @@ public class NESEmulator extends JFrame implements Runnable {
         allowDpadConflictsCheckbox = new JCheckBox("Allow D-Pad Conflicts", false);
         allowDpadConflictsCheckbox.addActionListener(e -> allowDpadConflicts = allowDpadConflictsCheckbox.isSelected());
 
+        showInputOverlayCheckbox = new JCheckBox("Show Input Overlay", false);
+        showInputOverlayCheckbox.addActionListener(e -> displayPanel.setShowInputOverlay(showInputOverlayCheckbox.isSelected()));
+
         JButton restoreDefaultsButton = new JButton("Restore Defaults");
         restoreDefaultsButton.addActionListener(e -> restoreDefaultKeybinds());
 
         JPanel bottomPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
         bottomPanel.add(allowDpadConflictsCheckbox);
+        bottomPanel.add(showInputOverlayCheckbox);
         bottomPanel.add(restoreDefaultsButton);
 
         controllerDialog.add(gridPanel, BorderLayout.CENTER);
@@ -344,9 +541,8 @@ public class NESEmulator extends JFrame implements Runnable {
         }
     }
 
-    //Backs the memory inspector table: $0000-$FFFF, 16 bytes/row, plus address/ASCII columns.
-    //Reads live from the bus each paint - no local snapshot; scanMemoryForChanges triggers
-    //targeted fireTableCellUpdated() calls to avoid flicker/scroll reset.
+    //Backs the memory inspector table ($0000-$FFFF, 16 bytes/row, plus address/ASCII columns), reading live from the
+    //bus each paint; scanMemoryForChanges fires targeted fireTableCellUpdated() calls to avoid flicker/scroll reset.
     private class MemoryTableModel extends AbstractTableModel {
         static final int ROWS = 4096;
         static final int COLS = 18; //address + 16 bytes + ascii
@@ -378,7 +574,7 @@ public class NESEmulator extends JFrame implements Runnable {
 
     }
 
-    private static final Color FROZEN_CELL_COLOR = new Color(0xADD8E6); //light blue
+    private static final Color FROZEN_CELL_COLOR = new Color(0xADD8E6);
 
     //Colors a memory inspector cell light blue when its RAM address is frozen.
     private class FrozenAwareCellRenderer extends DefaultTableCellRenderer {
@@ -441,13 +637,9 @@ public class NESEmulator extends JFrame implements Runnable {
     private static final Color TAS_UNEMULATED_COLOR = Color.WHITE;             //past tasValidFrontier: no savestate yet
     private static final Color TAS_MARKER_COLOR = Color.YELLOW;                //marked frame - takes priority over validity coloring
 
-    //Shared by both TAS table renderers: marked frame is always yellow; unemulated rows
-    //(>= tasValidFrontier) are plain; otherwise colored by whether an input placed on this row
-    //would actually be read. Row R's own input isn't polled until frame R+1 strobes the
-    //controller (see tasAdvanceOneFrame/seekToFrame's one-frame latency), so this checks
-    //R+1's strobe, not R's - a press on this row is only guaranteed registered if THAT comes
-    //back true. The last emulated row has no R+1 data yet and reads as red until the next
-    //frame is emulated, which is expected (see tasFrameStrobed's declaration).
+    //Shared by both TAS table renderers: marked frame is yellow, unemulated rows (>= tasValidFrontier) are plain,
+    //otherwise colored by whether an input on this row would be read. Row R's input isn't polled until frame R+1 strobes
+    //(one-frame latency), so this checks R+1's strobe - the last emulated row reads red until the next frame runs.
     private Color tasRowColor(int row) {
         if (tasMarkers.containsKey(row)) return TAS_MARKER_COLOR;
         if (row >= tasValidFrontier) return TAS_UNEMULATED_COLOR;
@@ -642,10 +834,9 @@ public class NESEmulator extends JFrame implements Runnable {
         topPanel.add(settingsButton);
 
         tasTableModel = new TasTableModel();
-        //Only the Frame# column drives selection/playhead; button cells are painted, never selected
-        //(see mouse listeners below). tasFrameColumnDragging lets a drag begun on Frame# keep
-        //scrubbing even if the cursor strays off-column. This only ever sees left-button drags
-        //(JTable routes right-button separately); forcing extend=false keeps it single-row.
+        //Only the Frame# column drives selection/playhead; button cells are painted, never selected. This only sees
+        //left-button drags (JTable routes right-button separately), tasFrameColumnDragging keeps a drag begun on Frame#
+        //scrubbing if the cursor strays off-column, and extend=false keeps it single-row.
         tasTable = new JTable(tasTableModel) {
             @Override
             public void changeSelection(int rowIndex, int columnIndex, boolean toggle, boolean extend) {
@@ -860,6 +1051,7 @@ public class NESEmulator extends JFrame implements Runnable {
     }
 
     private void openTasMaker() {
+        if (!requireRom()) return;
         tasActive = true;
         audioPlayer.setMuted(true);
         //Frame 0 must mean power-on; reset here the first time so pre-TAS-Maker play doesn't
@@ -868,35 +1060,39 @@ public class NESEmulator extends JFrame implements Runnable {
             synchronized (emulationLock) {
                 bus.hardReset();
             }
-            //Row 0 is hardware's pre-execution power-on state - it always exists, requires no
-            //simulation (bus.hardReset() above already IS that state), and is free exactly like
-            //the old "frame 0 is free via bus.hardReset()" comment on maybeCaptureTasCheckpoint
-            //described - it just never had a visible row of its own before. tasFrame starts at 1
-            //("row 0 exists, nothing beyond it yet") instead of 0 to reflect that.
+            //Row 0 is hardware's pre-execution power-on state: it always exists and needs no simulation (bus.hardReset()
+            //above IS that state), so tasFrame starts at 1 ("row 0 exists, nothing beyond it yet").
             tasInputs.add(0);
             tasFrame = 1;
             tasValidFrontier = 1;
             tasFrameStrobed.clear();
             tasFrameStrobed.add(false); //row 0 is never polled - nothing has booted yet
             tasCheckpoints.clear();
-            displayPanel.renderFrame();
+            renderFrameWithOverlay();
         }
         tasTableModel.fireTableDataChanged();
         syncTasSelection();
         tasDialog.setVisible(true);
+        if (preciseTraceDialog != null) preciseTraceDialog.refreshAvailability();
     }
 
     private void closeTasMaker() {
+        if (blockedByPreciseTrace()) return;
         setTasPlaying(false);
         tasActive = false;
-        //Back to normal real-time emulation.
+        if (preciseTraceDialog != null) preciseTraceDialog.refreshAvailability();
         audioPlayer.setMuted(false);
         tasDialog.setVisible(false);
         //Hand controller 1 back to the keyboard.
-        bus.setController1(controller1Bits | queuedInputBits);
+        setController1Tracked(controller1Bits | queuedInputBits);
     }
 
     private void setTasPlaying(boolean playing) {
+        if (playing && preciseTraceActive) {
+            if (tasPlayButton != null) tasPlayButton.setSelected(false);
+            blockedByPreciseTrace();
+            return;
+        }
         tasPlaying = playing;
         if (tasPlayButton != null) {
             tasPlayButton.setSelected(playing);
@@ -912,36 +1108,35 @@ public class NESEmulator extends JFrame implements Runnable {
     //Runs one more movie frame, appending a blank frame first if playback runs off the
     //recorded end - lets the timeline grow as you play.
     private void tasAdvanceOneFrame() {
+        if (preciseTraceActive) return;
         boolean grew = tasFrame >= tasInputs.size();
         if (grew) tasInputs.add(0);
-        //Row 0 (hardware's pre-execution power-on state) is pre-seeded by openTasMaker()/loadTas()
-        //with tasFrame starting at 1, so tasFrame is never 0 here - tasInputs.get(tasFrame-1)
-        //always has a real row behind it, no hardcoded-blank special case needed.
+        //Row 0 is pre-seeded by openTasMaker()/loadTas() with tasFrame starting at 1, so tasInputs.get(tasFrame-1)
+        //always has a real row behind it.
         int bits = tasInputs.get(tasFrame - 1);
         //Play is real-time, so always audible.
         audioPlayer.setMuted(false);
         int executedRow = tasFrame;
         synchronized (emulationLock) {
-            bus.setController1(bits);
+            setController1Tracked(bits);
             updateEmulationFrame("TAS row " + executedRow + " (Play)");
             recordFrameStrobe(executedRow);
             tasFrame++;
             if (tasFrame > tasValidFrontier) tasValidFrontier = tasFrame;
             maybeCaptureTasCheckpoint(tasFrame);
         }
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
         if (grew) tasTableModel.fireTableRowsInserted(executedRow, executedRow);
         else tasTableModel.fireTableRowsUpdated(executedRow, executedRow);
         syncTasSelection();
     }
 
-    //Moves the live playhead to right after frame targetFrame-1. Forward seeks to a still-valid
-    //target just keep running from the live state (fast path for scrubbing/playing forward).
-    //Otherwise restores the nearest greenzone checkpoint at/before targetFrame and replays the
-    //remainder, falling back to a full power-on replay if no checkpoint exists.
-    //Seeking never shrinks tasValidFrontier - only editFrameInput does.
+    //Moves the playhead to right after frame targetFrame-1: forward seeks to a still-valid target keep running from
+    //the live state, otherwise the nearest greenzone checkpoint at/before targetFrame is restored and the rest replayed
+    //(full power-on replay if none). Seeking never shrinks tasValidFrontier - only editFrameInput does.
     private void seekToFrame(int targetFrame) {
         if (targetFrame == tasFrame) return;
+        if (preciseTraceActive) { syncTasSelection(); return; }
         //Any seek/scrub is never real-time, so always silent. Only tasAdvanceOneFrame
         //(Play) or normal non-TAS emulation ever unmute.
         audioPlayer.setMuted(true);
@@ -960,17 +1155,14 @@ public class NESEmulator extends JFrame implements Runnable {
                     replayFrom = checkpointKey;
                 } else {
                     bus.hardReset();
-                    //Row 0 (hardware's pre-execution power-on state) always exists for free right
-                    //after a hardReset() - see openTasMaker()/loadTas() - so the rebuild-from-
-                    //scratch baseline is position 1 (row 0 present, nothing beyond it), not 0.
-                    //tasInputs[0] itself is untouched here - it's movie content, preserved across
-                    //rebuilds just like every other row.
+                    //Row 0 always exists for free right after hardReset() (see openTasMaker()/loadTas()), so the rebuild
+                    //baseline is position 1, not 0; tasInputs[0] is movie content and stays untouched.
                     replayFrom = 1;
                 }
             }
             for (int i = replayFrom; i < targetFrame; i++) {
                 int bits = i - 1 < tasInputs.size() ? tasInputs.get(i - 1) : 0;
-                bus.setController1(bits);
+                setController1Tracked(bits);
                 updateEmulationFrame("TAS row " + i + " (seek to " + targetFrame + ")");
                 recordFrameStrobe(i);
                 maybeCaptureTasCheckpoint(i + 1);
@@ -978,17 +1170,15 @@ public class NESEmulator extends JFrame implements Runnable {
             tasFrame = targetFrame;
         }
         if (targetFrame > tasValidFrontier) tasValidFrontier = targetFrame;
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
         syncTasSelection();
         tasTable.repaint();
     }
 
-    //Captures a greenzone checkpoint for executedCount frames if it lands on the checkpoint grid
-    //and isn't cached yet. CPU.State needs a clean instruction boundary, but a frame doesn't divide
-    //evenly into CPU cycles, so this clocks a few extra cycles (~7 max) past the boundary until
-    //CPU.isAtInstructionBoundary() is true. Controller bits are NOT touched here - those cycles
-    //still belong to the frame that just finished, so switching to the next row's input early
-    //would apply it before that frame's own loop iteration does (caused a real desync).
+    //Captures a greenzone checkpoint for executedCount frames if it's on the grid and not cached. CPU.State needs an
+    //instruction boundary and a frame doesn't divide evenly into CPU cycles, so this clocks up to ~7 extra cycles until
+    //CPU.isAtInstructionBoundary(); controller bits are NOT touched because those cycles still belong to the finished
+    //frame (switching to the next row's input early caused a real desync).
     private void maybeCaptureTasCheckpoint(int executedCount) {
         if (executedCount <= 1) return; //position 1 (row 0 only) is free via bus.hardReset()
         if (tasSavestateInterval <= 0 || executedCount % tasSavestateInterval != 0) return;
@@ -1071,10 +1261,9 @@ public class NESEmulator extends JFrame implements Runnable {
         insertBlankFramesAt(insertPos, 1);
     }
 
-    //Shared by "Insert", "Insert Frames...", and paste-insert: splices `count` blank
-    //frames into tasInputs at insertPos, pushing every existing frame at
-    //or after insertPos forward, then fixes up validity/checkpoints/markers/playhead
-    //to match. See insertClipboardAt for the copied-frames equivalent.
+    //Shared by "Insert", "Insert Frames...", and paste-insert: splices `count` blank frames in at insertPos,
+    //pushing later frames forward, then fixes up validity/checkpoints/markers/playhead. See insertClipboardAt
+    //for the copied-frames equivalent.
     private void insertBlankFramesAt(int insertPos, int count) {
         List<Integer> blanks = new ArrayList<>(count);
         for (int i = 0; i < count; i++) blanks.add(0);
@@ -1335,6 +1524,7 @@ public class NESEmulator extends JFrame implements Runnable {
 
     //Loads a movie saved by saveTas, replacing tasInputs and restarting from power-on.
     private void loadTas() {
+        if (blockedByPreciseTrace()) return;
         JFileChooser fileChooser = new JFileChooser();
         fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("TAS files (*.tas)", "tas"));
         int option = fileChooser.showOpenDialog(tasDialog);
@@ -1368,7 +1558,7 @@ public class NESEmulator extends JFrame implements Runnable {
         synchronized (emulationLock) {
             bus.hardReset();
         }
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
         tasTableModel.fireTableDataChanged();
         syncTasSelection();
     }
@@ -1376,6 +1566,8 @@ public class NESEmulator extends JFrame implements Runnable {
     //Emulation menu "Play Movie...": plays a saved .tas file back in real time, as if you'd
     //opened the TAS editor, seeked to frame 0, and hit Play - but without opening the editor.
     private void playMovie() {
+        if (blockedByPreciseTrace()) return;
+        if (!requireRom()) return;
         JFileChooser fileChooser = new JFileChooser();
         fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("TAS files (*.tas)", "tas"));
         int option = fileChooser.showOpenDialog(this);
@@ -1401,7 +1593,7 @@ public class NESEmulator extends JFrame implements Runnable {
         }
         playMovieInputs = loaded;
         playMovieFrame = 1;
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
     }
 
     //Emulation menu "Play .r08 File...": opens the options dialog (ACE Mode / Transition), whose
@@ -1439,6 +1631,7 @@ public class NESEmulator extends JFrame implements Runnable {
     }
 
     private void loadR08File() {
+        if (!requireRom()) return;
         JFileChooser fileChooser = new JFileChooser();
         fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(".r08 replay files (*.r08)", "r08"));
         int option = fileChooser.showOpenDialog(r08Dialog);
@@ -1475,16 +1668,117 @@ public class NESEmulator extends JFrame implements Runnable {
         r08PairIndex = 0;
         r08FrameCount = 0;
         r08StrobedThisFrame = false;
+        converting = false;
         r08AceMode = r08AceModeCheckbox.isSelected();
         r08TransitionEnabled = transitionEnabled;
         r08TransitionFrame = transitionFrame;
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
         r08Dialog.setVisible(false);
     }
 
-    //Bus.onControllerStrobe callback: fires on every $4016 strobe rising edge, mid-frame, from
-    //whichever thread is currently running cpu.step() (always under emulationLock, same call
-    //stack, so no extra synchronization needed here).
+    private void openR08ToMovieDialog() {
+        if (r08ConvertDialog == null) {
+            r08ConvertDialog = new JDialog(this, "Load .r08 File", false);
+            r08ConvertDialog.setLayout(new BorderLayout());
+
+            JPanel panel = new JPanel();
+            panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+            panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+
+
+            JLabel dropdownLabel = new JLabel("Format:");
+            dropdownLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+
+            String[] options = {"Bizhawk", "FCEUX"};
+            formatBox = new JComboBox<>(options);
+            formatBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+            JLabel fceuxWarning = new JLabel("FCEUX is inaccurate, consider using Bizhawk.");
+            fceuxWarning.setForeground(new Color(0xB0, 0x30, 0x30));
+            fceuxWarning.setAlignmentX(Component.LEFT_ALIGNMENT);
+            fceuxWarning.setVisible(false);
+            formatBox.addActionListener(e -> {
+                fceuxWarning.setVisible("FCEUX".equals(formatBox.getSelectedItem()));
+                r08ConvertDialog.pack();
+            });
+
+
+            JButton loadButton = new JButton("Load .r08 File...");
+            loadButton.addActionListener(e -> loadR08File2());
+            loadButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+            panel.add(dropdownLabel);
+            panel.add(Box.createVerticalStrut(4));
+            panel.add(formatBox);
+            panel.add(Box.createVerticalStrut(4));
+            panel.add(fceuxWarning);
+            panel.add(Box.createVerticalStrut(10));
+            panel.add(loadButton);
+
+            r08ConvertDialog.add(panel, BorderLayout.CENTER);
+            r08ConvertDialog.pack();
+            r08ConvertDialog.setLocationRelativeTo(this);
+        }
+        r08ConvertDialog.setVisible(true);
+    }
+
+    private void loadR08File2() {
+        if (!requireRom()) return;
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(".r08 replay files (*.r08)", "r08"));
+        int option = fileChooser.showOpenDialog(r08Dialog);
+        if (option != JFileChooser.APPROVE_OPTION) return;
+
+        byte[] data;
+        try {
+            data = java.nio.file.Files.readAllBytes(fileChooser.getSelectedFile().toPath());
+        } catch (java.io.IOException ex) {
+            JOptionPane.showMessageDialog(r08Dialog, "Failed to load .r08 file: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        if (data.length < 2) {
+            JOptionPane.showMessageDialog(r08Dialog, "File is too short to contain any (P1, P2) input pairs.", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        boolean transitionEnabled = false;
+        int transitionFrame = 0;
+        if (transitionEnabled) {
+            try {
+                transitionFrame = Integer.parseInt(r08TransitionField.getText().trim());
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(r08Dialog, "Transition frame must be a whole number.", "Error", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+        }
+
+        playMovieInputs = null; //movie and r08 playback are mutually exclusive
+        synchronized (emulationLock) {
+            bus.hardReset();
+        }
+        r08Data = data;
+        r08PairIndex = 0;
+        r08FrameCount = 0;
+        r08StrobedThisFrame = false;
+        transitionEnabled = false;
+        r08AceMode = false;
+        Object selection = formatBox.getSelectedItem();
+
+        formatBizhawk = "Bizhawk".equals(selection);
+        converting = true;
+        lastNonLagFrame = -1; //no frame logged yet (see logInputs())
+
+        r08TransitionEnabled = false;
+        renderFrameWithOverlay();
+        r08ConvertDialog.setVisible(false);
+        inputlog.replace(0, inputlog.length(), "");
+        //BizHawk splits the LogKey on '#', so there must be no space before the first '#'.
+        if (formatBizhawk) inputlog.append("[Input]\r\nLogKey:#Power|Reset|#P1 Up|P1 Down|P1 Left|P1 Right|P1 Start|P1 Select|P1 B|P1 A|#P2 Up|P2 Down|P2 Left|P2 Right|P2 Start|P2 Select|P2 B|P2 A|\r\n");
+    }
+
+    //Bus.onControllerStrobe callback: fires on every $4016 strobe rising edge, mid-frame, on whichever thread is
+    //running cpu.step() - always under emulationLock, so no extra synchronization here.
     private void onR08ControllerStrobe() {
         if (r08Data == null) return;
         boolean perStrobeMode = r08AceMode || (r08TransitionEnabled && r08FrameCount >= r08TransitionFrame);
@@ -1492,15 +1786,151 @@ public class NESEmulator extends JFrame implements Runnable {
             advanceR08Pair(); //ACE Mode / past the Transition frame: every strobe moves on
             return;
         }
-        //Per-frame mode: nothing is pressed at the start of the frame (see
-        //applyPlaybackInputsForFrame()) - only the FIRST strobe this frame reveals the current
-        //pair, which then holds for the rest of the frame regardless of further strobes.
-        //Advancing to the NEXT pair only happens at frame end, and only if this flag ended up
-        //true (see advancePlaybackAfterFrame()) - an unstrobed frame stays on the same pair.
+        //Per-frame mode: nothing is pressed at frame start (applyPlaybackInputsForFrame()); only the FIRST strobe reveals
+        //the current pair, which then holds for the rest of the frame. Advancing to the next pair happens at frame end only
+        //if this flag ended true (advancePlaybackAfterFrame()) - an unstrobed frame stays on the same pair.
         if (!r08StrobedThisFrame) {
             r08StrobedThisFrame = true;
+            if (converting) logInputs();
             applyR08CurrentPair();
+
         }
+    }
+
+    private void logInputs() {
+        //Frames between the last logged one and this one had no strobe: emit a lag line for each.
+        for (int i = lastNonLagFrame + 1; i < currentFrame; i++) inputlog.append(movieInputLine(0, 0));
+        lastNonLagFrame = currentFrame;
+        int P1 = r08Data[r08PairIndex * 2] & 0xFF;
+        int P2 = r08Data[(r08PairIndex * 2) + 1] & 0xFF;
+        inputlog.append(movieInputLine(P1, P2));
+    }
+
+    //One movie input line for the selected format. .r08 bit order: R L D U Start Select B A (bit 0 = Right).
+    private String movieInputLine(int P1, int P2) {
+        StringBuilder line = new StringBuilder();
+        if (formatBizhawk) {
+            line.append("|..|").append(bizhawkButtons(P1)).append('|').append(bizhawkButtons(P2)).append("|\r\n");
+        } else {
+            line.append("|0|").append(fceuxButtons(P1)).append('|').append(fceuxButtons(P2)).append("||\r\n");
+        }
+        return line.toString();
+    }
+
+    //BizHawk NesHawk order: Up Down Left Right Start Select B A.
+    private static String bizhawkButtons(int bits) {
+        return new StringBuilder()
+                .append((bits & 0x08) != 0 ? 'U' : '.').append((bits & 0x04) != 0 ? 'D' : '.')
+                .append((bits & 0x02) != 0 ? 'L' : '.').append((bits & 0x01) != 0 ? 'R' : '.')
+                .append((bits & 0x10) != 0 ? 'S' : '.').append((bits & 0x20) != 0 ? 's' : '.')
+                .append((bits & 0x40) != 0 ? 'B' : '.').append((bits & 0x80) != 0 ? 'A' : '.').toString();
+    }
+
+    //FCEUX .fm2 order: Right Left Down Up sTart Select B A.
+    private static String fceuxButtons(int bits) {
+        return new StringBuilder()
+                .append((bits & 0x01) != 0 ? 'R' : '.').append((bits & 0x02) != 0 ? 'L' : '.')
+                .append((bits & 0x04) != 0 ? 'D' : '.').append((bits & 0x08) != 0 ? 'U' : '.')
+                .append((bits & 0x10) != 0 ? 'T' : '.').append((bits & 0x20) != 0 ? 'S' : '.')
+                .append((bits & 0x40) != 0 ? 'B' : '.').append((bits & 0x80) != 0 ? 'A' : '.').toString();
+    }
+
+    private void generateMovieFile() {
+        if (!formatBizhawk) { generateFm2File(); return; }
+        String outputFilePath = System.getProperty("user.home") + "/Desktop/output.bk2";
+
+        StringBuilder content = new StringBuilder();
+
+        content.append("MovieVersion BizHawk v2.0\r\n");
+        content.append("Author default user\r\n");
+        content.append("Core NesHawk\r\n");
+        content.append("Platform NES\r\n");
+        content.append("emuVersion Version 2.10\r\n");
+        content.append("OriginalEmuVersion Version 2.10\r\n");
+        content.append("GameName " + RomName + "\r\n");
+        content.append("SHA1 " + SHA1 + "\r\n");
+        content.append("rerecordCount 0\r\n");
+        content.append("\r\n");
+
+        String header = content.toString();
+
+        inputlog.append("[/Input]\r\n");
+
+        String inputs = inputlog.toString();
+        converting = false;
+
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outputFilePath))) {
+            //Entry names are case-sensitive in BizHawk's zip reader: "BizState 1.0", not "Bizstate".
+            addTextToZip(zos, "2\r\n", "BizState 1.0");
+            addTextToZip(zos, "Version 2.10\r\n", "BizVersion.txt");
+            addTextToZip(zos, "\r\n", "Comments.txt");
+            addTextToZip(zos, header, "Header.txt");
+            addTextToZip(zos, inputs, "Input Log.txt");
+            addTextToZip(zos, "\r\n", "Subtitles.txt");
+            addTextToZip(zos, "{\"o\":{\"$type\":\"BizHawk.Emulation.Cores.Nintendo.NES.NES+NESSyncSettings, BizHawk.Emulation.Cores\",\"BoardProperties\":{},\"RegionOverride\":0,\"Controls\":{\"Famicom\":false,\"NesLeftPort\":\"ControllerNES\",\"NesRightPort\":\"ControllerNES\",\"FamicomExpPort\":\"UnpluggedFam\"},\"VSDipswitches\":{\"Dip_Switch_1\":false,\"Dip_Switch_2\":false,\"Dip_Switch_3\":false,\"Dip_Switch_4\":false,\"Dip_Switch_5\":false,\"Dip_Switch_6\":false,\"Dip_Switch_7\":false,\"Dip_Switch_8\":false},\"InitialWRamStatePattern\":[]}}", "SyncSettings.json");
+
+            final String savedTo = outputFilePath;
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                    "Movie written to:\n" + savedTo, "r08 to movie", JOptionPane.INFORMATION_MESSAGE));
+        } catch (IOException e) {
+            System.err.println("Error creating archive");
+            e.printStackTrace();
+            final String msg = e.getMessage();
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                    "Failed to write movie: " + msg, "r08 to movie", JOptionPane.ERROR_MESSAGE));
+        }
+    }
+
+    //FCEUX .fm2: text header then one "|cmd|port0|port1||" line per frame (lag frames included).
+    private void generateFm2File() {
+        String outputFilePath = System.getProperty("user.home") + "/Desktop/output.fm2";
+        converting = false;
+        StringBuilder content = new StringBuilder();
+        content.append("version 3\r\n");
+        content.append("emuVersion 20605\r\n");
+        content.append("rerecordCount 0\r\n");
+        content.append("palFlag 0\r\n");
+        content.append("romFilename ").append(RomName).append("\r\n");
+        content.append("romChecksum base64:").append(RomMd5Base64).append("\r\n");
+        content.append("guid ").append(java.util.UUID.randomUUID().toString().toUpperCase()).append("\r\n");
+        content.append("fourscore 0\r\n");
+        content.append("microphone 0\r\n");
+        content.append("port0 1\r\n");
+        content.append("port1 1\r\n");
+        content.append("port2 0\r\n");
+        content.append("FDS 0\r\n");
+        content.append("NewPPU 0\r\n");
+        content.append("RAMInitOption 0\r\n");
+        content.append("comment author r08 to movie\r\n");
+        content.append("|0|........|........||\n");
+        content.append("|0|........|........||\n");
+        content.append(inputlog);
+        try {
+            Files.write(Paths.get(outputFilePath), content.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            final String savedTo = outputFilePath;
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                    "Movie written to:\n" + savedTo, "r08 to movie", JOptionPane.INFORMATION_MESSAGE));
+        } catch (IOException e) {
+            final String msg = e.getMessage();
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                    "Failed to write movie: " + msg, "r08 to movie", JOptionPane.ERROR_MESSAGE));
+        }
+    }
+
+    private void addFileToZip(ZipOutputStream zos, Path filePath, String entryName) throws IOException {
+        ZipEntry entry = new ZipEntry(entryName);
+        zos.putNextEntry(entry);
+        Files.copy(filePath, zos);
+        zos.closeEntry();
+    }
+
+    private void addTextToZip(ZipOutputStream zos, String content, String entryName) throws IOException {
+        ZipEntry entry = new ZipEntry(entryName);
+        zos.putNextEntry(entry);
+
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        zos.write(bytes);
+        zos.closeEntry();
     }
 
     //Moves to the next (P1, P2) pair, or ends r08 playback (falling back to normal keyboard
@@ -1509,8 +1939,9 @@ public class NESEmulator extends JFrame implements Runnable {
         r08PairIndex++;
         if ((r08PairIndex + 1) * 2 > r08Data.length) {
             r08Data = null;
-            bus.setController1(controller1Bits | queuedInputBits);
-            bus.setController2(0);
+            setController1Tracked(controller1Bits | queuedInputBits);
+            setController2Tracked(0);
+            if (converting) generateMovieFile();
             return;
         }
         applyR08CurrentPair();
@@ -1519,8 +1950,8 @@ public class NESEmulator extends JFrame implements Runnable {
     private void applyR08CurrentPair() {
         int p1 = reverseByte(r08Data[r08PairIndex * 2] & 0xFF);
         int p2 = reverseByte(r08Data[r08PairIndex * 2 + 1] & 0xFF);
-        bus.setController1(p1);
-        bus.setController2(p2);
+        setController1Tracked(p1);
+        setController2Tracked(p2);
     }
 
     //.r08's bit order (A=0x80 ... Right=0x01) is this emulator's internal order (A=0x01 ...
@@ -1537,12 +1968,12 @@ public class NESEmulator extends JFrame implements Runnable {
         if (playMovieInputs != null) {
             int idx = playMovieFrame - 1;
             if (idx < playMovieInputs.size()) {
-                bus.setController1(playMovieInputs.get(idx));
+                setController1Tracked(playMovieInputs.get(idx));
             } else {
                 //Ran out of movie input - stop movie playback, hand control back to the keyboard,
                 //but let emulation keep running.
                 playMovieInputs = null;
-                bus.setController1(controller1Bits | queuedInputBits);
+                setController1Tracked(controller1Bits | queuedInputBits);
             }
         } else if (r08Data != null) {
             int pairCount = r08Data.length / 2;
@@ -1556,23 +1987,20 @@ public class NESEmulator extends JFrame implements Runnable {
                 } else {
                     //Per-frame mode: hold nothing until the frame's first strobe reveals the
                     //current pair (onR08ControllerStrobe()).
-                    bus.setController1(0);
-                    bus.setController2(0);
+                    setController1Tracked(0);
+                    setController2Tracked(0);
                 }
             } else {
                 r08Data = null;
-                bus.setController1(controller1Bits | queuedInputBits);
-                bus.setController2(0);
+                setController1Tracked(controller1Bits | queuedInputBits);
+                setController2Tracked(0);
             }
         }
     }
 
-    //Called from run()'s real-time loop right after updateEmulationFrame() returns. Per-frame mode
-    //(the default) advances here ONLY if the frame was actually strobed at least once (a lag frame
-    //stays on the same pair, waiting to be strobed again next frame) - matches
-    //onR08ControllerStrobe() revealing the pair on the frame's first strobe rather than
-    //unconditionally at frame start. Per-strobe mode (ACE Mode, or past the Transition frame)
-    //already advanced during the frame via onR08ControllerStrobe(), so this is a no-op for it.
+    //Called from run()'s loop right after updateEmulationFrame(). Per-frame mode advances ONLY if the frame was strobed
+    //at least once (a lag frame stays on the same pair, matching onR08ControllerStrobe() revealing on first strobe);
+    //per-strobe mode (ACE Mode, or past the Transition frame) already advanced mid-frame, so this is a no-op for it.
     private void advancePlaybackAfterFrame() {
         if (playMovieInputs != null) {
             playMovieFrame++;
@@ -1680,7 +2108,6 @@ public class NESEmulator extends JFrame implements Runnable {
         traceDialog.add(topPanel, BorderLayout.NORTH);
         traceDialog.add(new JScrollPane(traceTextArea), BorderLayout.CENTER);
 
-        //Refresh UI whenever window is focused
         traceDialog.addComponentListener(new ComponentAdapter() {
             @Override
             public void componentShown(ComponentEvent e) {
@@ -1692,7 +2119,6 @@ public class NESEmulator extends JFrame implements Runnable {
     private JMenuBar createMenuBar() {
         JMenuBar menuBar = new JMenuBar();
 
-        //Emulation menu
 
         JMenu emulationMenu = new JMenu("Emulation");
         JMenuItem openRomItem = new JMenuItem("Open ROM...");
@@ -1723,13 +2149,22 @@ public class NESEmulator extends JFrame implements Runnable {
         playR08Item.addActionListener(e -> openR08Dialog());
         emulationMenu.add(playR08Item);
 
+        JMenuItem R08toMovie = new JMenuItem("R08 to Movie...");
+        R08toMovie.addActionListener(e -> openR08ToMovieDialog());
+        emulationMenu.add(R08toMovie);
+
+        emulationMenu.addSeparator();
+
+        JMenuItem fullScreenItem = new JMenuItem("Full Screen (F11)");
+        fullScreenItem.addActionListener(e -> toggleFullScreen());
+        emulationMenu.add(fullScreenItem);
+
         emulationMenu.addSeparator();
 
         JMenuItem exitItem = new JMenuItem("Exit");
         exitItem.addActionListener(e -> System.exit(0));
         emulationMenu.add(exitItem);
 
-        //Tools Menu
 
         JMenu toolsMenu = new JMenu("Tools");
 
@@ -1745,13 +2180,21 @@ public class NESEmulator extends JFrame implements Runnable {
         tasMakerItem.addActionListener(e -> openTasMaker());
         toolsMenu.add(tasMakerItem);
 
-        //Debug Menu
+        JMenuItem preciseTracingItem = new JMenuItem("Precise Tracing...");
+        preciseTracingItem.addActionListener(e -> openPreciseTracing());
+        toolsMenu.add(preciseTracingItem);
+
 
         JMenu debugMenu = new JMenu("Debug");
 
         JMenuItem traceItem = new JMenuItem("Trace");
         traceItem.addActionListener(e -> traceDialog.setVisible(true));
         debugMenu.add(traceItem);
+
+        JCheckBoxMenuItem oamDecayItem = new JCheckBoxMenuItem("Emulate OAM Decay", PPU.oamDecayEnabled);
+        oamDecayItem.setToolTipText("OAM is DRAM: with rendering disabled for more than a few ms its contents decay to $00, as on real hardware.");
+        oamDecayItem.addActionListener(e -> PPU.oamDecayEnabled = oamDecayItem.isSelected());
+        debugMenu.add(oamDecayItem);
 
         JMenuItem nametableViewer = new JMenuItem("Nametable Viewer");
         nametableViewer.addActionListener(e -> {
@@ -1793,8 +2236,9 @@ public class NESEmulator extends JFrame implements Runnable {
             displayPanel.addMouseListener(new java.awt.event.MouseAdapter() {
                 @Override public void mouseClicked(java.awt.event.MouseEvent ev) {
                     displayPanel.removeMouseListener(this);
-                    int nx = ev.getX() * NESDisplayPanel.VIEW_WIDTH / Math.max(1, displayPanel.getWidth());
-                    int ny = ev.getY() * NESDisplayPanel.VIEW_HEIGHT / Math.max(1, displayPanel.getHeight());
+                    Point nes = displayPanel.toNesPixel(ev.getX(), ev.getY());
+                    if (nes == null) return; //clicked a letterbox bar
+                    int nx = nes.x, ny = nes.y;
                     //24x24 ASCII grid centered on the click; imprecise but wide enough to cover it.
                     int gx0 = Math.max(0, nx - 12), gy0 = Math.max(0, ny - 12);
                     String text = String.format("clicked (%d,%d)%n%n", nx, ny) + ppu.explainGrid(gx0, gy0, 24, 24);
@@ -1808,7 +2252,6 @@ public class NESEmulator extends JFrame implements Runnable {
         });
         debugMenu.add(explainPixelItem);
 
-        //attach menus to bar
 
         menuBar.add(emulationMenu);
         menuBar.add(toolsMenu);
@@ -1816,7 +2259,6 @@ public class NESEmulator extends JFrame implements Runnable {
 
         return menuBar;
     }
-    //Starts the emulation thread
     public synchronized void start() {
         if (running) return;
         running = true;
@@ -1825,7 +2267,6 @@ public class NESEmulator extends JFrame implements Runnable {
         emulatorThread.start();
     }
 
-    //Stops the emulation thread
     public synchronized void stop() {
         running = false;
         try {
@@ -1841,7 +2282,12 @@ public class NESEmulator extends JFrame implements Runnable {
     //Main emulation loop (~60FPS)
     @Override
     public void run() {
-        final double nsPerFrame = 1_000_000_000.0 / 60.0;
+        //Real NTSC frame rate, not 60.0: at 60.0 the emulator produces ~0.17% fewer audio
+        //samples than the sound card consumes, so the queue slowly drains into dropouts.
+        final double nsPerFrame = 1_000_000_000.0 / 60.0988;
+        //Cap on how many frames to run in one go after a stall (window drag, GC pause).
+        //Bursting through a big backlog floods the audio ring and drops a chunk of sound.
+        final double maxCatchUpFrames = 3;
         long lastTime = System.nanoTime();
         double delta = 0;
 
@@ -1849,17 +2295,18 @@ public class NESEmulator extends JFrame implements Runnable {
             long now = System.nanoTime();
             delta += (now - lastTime) / nsPerFrame;
             lastTime = now;
+            if (delta > maxCatchUpFrames) delta = maxCatchUpFrames;
 
-            //catch up if behind schedule
             while (delta >= 1) {
-                if (!paused && !tasActive) {
+                if (!paused && !tasActive && romLoaded()) {
                     synchronized (emulationLock) {
                         //Re-check inside the lock: tasActive may have flipped true while we were
                         //waiting to acquire it (e.g. openTasMaker() got there first and is mid
                         //hardReset()) - stepping now would race a whole frame into that reset.
-                        if (!paused && !tasActive) {
+                        if (!paused && !tasActive && romLoaded()) {
                             applyPlaybackInputsForFrame();
                             updateEmulationFrame();
+                            currentFrame++;
                             advancePlaybackAfterFrame();
                         }
                     }
@@ -1867,9 +2314,8 @@ public class NESEmulator extends JFrame implements Runnable {
                 delta--;
             }
 
-            //render current frame
-            if (!paused && !tasActive) {
-                displayPanel.renderFrame();
+            if (!paused && !tasActive && romLoaded()) {
+                renderFrameWithOverlay();
             }
 
             //brief pause to give thread CPU time back to the OS
@@ -1883,20 +2329,21 @@ public class NESEmulator extends JFrame implements Runnable {
 
     private void stepOneFrame() {
         if (!paused || tasActive) return;
+        if (!requireRom()) return;
 
         boolean wasTracing = tracingEnabled;
         tracingEnabled = true;
 
         //Apply queued taps for this frame, then drop them so they don't bleed into later steps.
         synchronized (emulationLock) {
-            bus.setController1(controller1Bits | queuedInputBits);
+            setController1Tracked(controller1Bits | queuedInputBits);
             queuedInputBits = 0;
 
             updateEmulationFrame();
 
-            bus.setController1(controller1Bits);
+            setController1Tracked(controller1Bits);
         }
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
 
         tracingEnabled = wasTracing;
     }
@@ -1905,11 +2352,9 @@ public class NESEmulator extends JFrame implements Runnable {
         updateEmulationFrame(null);
     }
 
-    //rowLabel: when non-null (TAS Maker's tasAdvanceOneFrame()/seekToFrame() only), stamps the
-    //resulting trace with an unambiguous "which row is this" header - added expressly to settle,
-    //from the trace pane itself, whether a reported "row 0 looks like row 1" is a real skipped-
-    //frame bug or just a mismatch between what row the user thinks they're viewing and what
-    //actually produced this text.
+    //rowLabel (TAS Maker's tasAdvanceOneFrame()/seekToFrame() only) stamps the trace with an unambiguous "which row
+    //is this" header, to settle from the trace pane whether a reported "row 0 looks like row 1" is a real skipped-frame
+    //bug or just a viewing mismatch.
     private void updateEmulationFrame(String rowLabel) {
         frameTraceBuffer.setLength(0);
         long startCycle = cpu.totalCycles;
@@ -1930,6 +2375,13 @@ public class NESEmulator extends JFrame implements Runnable {
             ppu.step();
         } while (!ppu.consumeVBlankStart());
 
+        afterFrameEmulated(rowLabel, startCycle);
+    }
+
+    //Everything updateEmulationFrame() does once the frame's cycles have run: trace pane /
+    //log file output and debug-window refreshes. Split out so a Precise Trace (which runs
+    //the cycles itself, slowly) ends with identical bookkeeping.
+    private void afterFrameEmulated(String rowLabel, long startCycle) {
         if (rowLabel != null && frameTraceBuffer.length() > 0) {
             frameTraceBuffer.insert(0, "=== " + rowLabel + " | CPU cycles [" + startCycle + ", " + cpu.totalCycles + ") ===\n");
         }
@@ -1937,21 +2389,14 @@ public class NESEmulator extends JFrame implements Runnable {
         //No explicit render call needed - the PPU already wrote pixels into the display
         //buffer scanline-by-scanline as it stepped (see PPU.renderScanline).
 
-        //Update trace UI text area if active. updateEmulationFrame() is called from two very
-        //different threads: the normal-play loop runs on the background "NES-MainLoop" thread
-        //(tasActive false there, guarded in run()), so it must marshal onto the EDT via
-        //invokeLater for thread safety. TAS Maker's tasAdvanceOneFrame()/seekToFrame() are
-        //themselves called from Swing button/Timer callbacks, i.e. already on the EDT - queuing
-        //another invokeLater there just adds a race against the *next* Play timer tick (which
-        //also runs on the EDT) clearing/refilling frameTraceBuffer before this one's callback
-        //gets to run, so the pane ends up showing the frame moved ONTO instead of the frame
-        //moved FROM. Update synchronously whenever we're already on the EDT.
+        //Update trace UI if active. run()'s background "NES-MainLoop" thread must marshal onto the EDT via invokeLater,
+        //but TAS Maker's tasAdvanceOneFrame()/seekToFrame() already run on the EDT - another invokeLater there races the
+        //next Play timer tick refilling frameTraceBuffer (pane shows the frame moved ONTO instead of FROM), so update
+        //synchronously when already on the EDT.
         if (tracingEnabled && frameTraceBuffer.length() > 0) {
             String traceSnapshot = frameTraceBuffer.toString();
-            //setText() doesn't reliably reset the visible scroll position - a many-thousand-line
-            //frame trace can otherwise leave the pane showing wherever it last scrolled (e.g. the
-            //bottom, near the frame's LAST cycle), making a fully-correct cycle-0-first trace look
-            //like it "starts" mid-frame. Force the caret (and thus the viewport) to the top.
+            //setText() doesn't reliably reset the scroll position, so a many-thousand-line trace can be left showing the
+            //bottom and look like it starts mid-frame; force the caret (and viewport) to the top.
             Runnable applyTrace = () -> { traceTextArea.setText(traceSnapshot); traceTextArea.setCaretPosition(0); };
             if (SwingUtilities.isEventDispatchThread()) applyTrace.run();
             else SwingUtilities.invokeLater(applyTrace);
@@ -1979,21 +2424,58 @@ public class NESEmulator extends JFrame implements Runnable {
     }
 
     private void openRomChooser() {
+        if (blockedByPreciseTrace()) return;
         JFileChooser fileChooser = new JFileChooser();
         int option = fileChooser.showOpenDialog(this);
         if (option == JFileChooser.APPROVE_OPTION) {
             File selectedFile = fileChooser.getSelectedFile();
+            generateSHA1Hash(selectedFile);
             try {
                 Cartridge cart = new Cartridge(selectedFile);
                 cart.connectCPU(cpu);
                 synchronized (emulationLock) {
                     bus.insertCartridge(cart);
-                    bus.reset();
+                    bus.hardReset(); //inserting a cartridge is a power-on, not a reset-button press
                 }
+                renderFrameWithOverlay();
                 System.out.println("Successfully loaded ROM: " + selectedFile.getName());
+                RomName = selectedFile.getName();
             } catch (Exception ex) {
                 JOptionPane.showMessageDialog(this, "Failed to load ROM: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             }
+        }
+    }
+
+    private void generateSHA1Hash(File selectedFile) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-1");
+            FileInputStream fis = new FileInputStream(selectedFile);
+            byte[] fileBytes = fis.readAllBytes();
+            byte[] hashBytes = digest.digest(fileBytes);
+            RomMd5Base64 = fceuxRomMd5(fileBytes);
+
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hashBytes) {
+                hexString.append(String.format("%02X", b));
+            }
+            this.SHA1 = hexString.toString().toUpperCase();
+        } catch (NoSuchAlgorithmException | IOException e) {
+            System.err.println("Error generating hash:");
+            e.printStackTrace();
+        }
+    }
+
+    //FCEUX hashes PRG+CHR only: skip the 16-byte iNES header and a 512-byte trainer if flagged.
+    private static String fceuxRomMd5(byte[] file) {
+        try {
+            int start = 16;
+            if (file.length >= 16 && (file[6] & 0x04) != 0) start += 512;
+            if (start > file.length) start = file.length;
+            MessageDigest md5 = MessageDigest.getInstance("MD5");
+            md5.update(file, start, file.length - start);
+            return java.util.Base64.getEncoder().encodeToString(md5.digest());
+        } catch (NoSuchAlgorithmException e) {
+            return "";
         }
     }
 
@@ -2013,7 +2495,6 @@ public class NESEmulator extends JFrame implements Runnable {
         System.out.println(paused ? "Emulation Paused" : "Emulation Resumed");
     }
 
-    //Updates debug UI controls
     private void updateDebugUI() {
         if (stepButton != null) {
             stepButton.setEnabled(paused);
@@ -2024,6 +2505,8 @@ public class NESEmulator extends JFrame implements Runnable {
     }
 
     private void resetEmulation() {
+        if (blockedByPreciseTrace()) return;
+        if (!requireRom()) return;
         System.out.println("Resetting PPU and CPU...");
         synchronized (emulationLock) {
             bus.reset();
@@ -2032,11 +2515,13 @@ public class NESEmulator extends JFrame implements Runnable {
 
     //Full power-on cycle: also clears RAM (soft reset leaves RAM intact).
     private void powerCycle() {
+        if (blockedByPreciseTrace()) return;
+        if (!requireRom()) return;
         System.out.println("Power cycling (RAM cleared)...");
         synchronized (emulationLock) {
             bus.hardReset();
         }
-        displayPanel.renderFrame();
+        renderFrameWithOverlay();
     }
 
     public static void main(String[] args) {

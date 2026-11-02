@@ -3,24 +3,22 @@ import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.SourceDataLine;
 
-//Takes the APU's raw mixer output (see APU.getOutputSample) and pushes it to the
-//system's default audio device. The NES DAC output only ever swings positive (it's
-//AC-coupled to the amplifier by an RC filter on real hardware), so a one-pole
-//high-pass filter here does the same job in software - without it, every channel
-//would just sound like a volume level rather than a waveform.
-//
-//writeSample() is called from the emulation thread once per output sample and must
-//never block: SourceDataLine.write() blocks whenever the device's internal buffer is
-//full, and blocking there would stall the CPU/PPU emulation itself (this is what used
-//to cause multi-second freezes whenever emulation got even slightly ahead of
-//real-time audio playback). Instead, samples are pushed into a small ring buffer and
-//a dedicated playback thread drains it into the line, so any blocking only ever
-//happens off the emulation thread.
+//Pushes the APU's raw mixer output (see APU.getOutputSample) to the default audio device through a one-pole
+//high-pass filter, mirroring the RC coupling that turns the NES DAC's positive-only output into a waveform.
+//writeSample() runs on the emulation thread and must never block, so samples go into a ring buffer that a
+//dedicated playback thread drains into the SourceDataLine (blocking there used to freeze emulation for seconds).
 public class AudioPlayer {
 
     private static final float SAMPLE_RATE = 44100f;
     private static final double HIGH_PASS_R = 0.996;
-    private static final int RING_CAPACITY_BYTES = 16384; //~185ms at 44100Hz/16-bit mono
+    private static final int RING_CAPACITY_BYTES = 32768; //~370ms at 44100Hz/16-bit mono
+    //Device-side buffer. Bigger than the queue we aim to keep so line.write() only
+    //blocks (and the ring only fills) when emulation genuinely runs ahead.
+    private static final int LINE_BUFFER_BYTES = 16384;
+    //Audio to keep queued (ring + device), ~60ms: enough to ride out a late frame or GC pause without feeling laggy.
+    //The APU steers its output rate toward this (APU.adjustOutputRate) and playbackLoop primes the device to it after an underrun.
+    public static final int TARGET_QUEUE_SAMPLES = 2646;
+    private static final byte[] PRIME_SILENCE = new byte[TARGET_QUEUE_SAMPLES * 2];
 
     private final byte[] ring = new byte[RING_CAPACITY_BYTES];
     private final Object ringLock = new Object();
@@ -29,17 +27,18 @@ public class AudioPlayer {
     private int available = 0; //bytes currently queued for playback
 
     private volatile boolean running = false;
-    //When true, writeSample still runs the high-pass filter (so audio doesn't click
-    //when unmuted mid-stream) but drops the sample instead of queuing it. Used by the
-    //TAS Maker to silence replay of frames that are just being re-derived (seeking,
-    //scrubbing, already-validated frames) rather than actually played back.
+    //When true, writeSample still runs the high-pass filter (no click on unmute) but drops the sample.
+    //The TAS Maker uses this to silence frames that are only being re-derived (seeking, scrubbing).
     private volatile boolean muted = false;
     private Thread playbackThread;
-    private SourceDataLine line;
-    //Guards every direct call into the SourceDataLine (write/stop/flush/start) so
-    //flush() can't race the playback thread's write() - see flush()'s comment for why
-    //that race is exactly what caused audio to stack up and loop on Windows.
+    private volatile SourceDataLine line;
+    //Guards every direct SourceDataLine call so flush() can't race the playback thread's write() - see flush().
     private final Object lineLock = new Object();
+
+    //Times the device ran completely dry (includes the deliberate prime after
+    //start/flush). Diagnostic only.
+    private volatile int underruns = 0;
+    public int getUnderrunCount() { return underruns; }
 
     private double prevInput = 0.0;
     private double prevOutput = 0.0;
@@ -49,7 +48,7 @@ public class AudioPlayer {
         try {
             AudioFormat format = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
             line = AudioSystem.getSourceDataLine(format);
-            line.open(format, 4096);
+            line.open(format, LINE_BUFFER_BYTES);
             line.start();
         } catch (LineUnavailableException e) {
             System.err.println("Audio device unavailable, running without sound: " + e.getMessage());
@@ -105,40 +104,47 @@ public class AudioPlayer {
                 ringLock.notifyAll();
             }
             synchronized (lineLock) {
-                if (running) line.write(chunk, 0, count);
+                if (!running) return;
+                //Device fully drained (first write after start/flush, or a real underrun): prime with silence
+                //so playback resumes with headroom instead of at zero latency where every hiccup is an audible gap.
+                if (line.available() >= line.getBufferSize()) {
+                    underruns++;
+                    line.write(PRIME_SILENCE, 0, PRIME_SILENCE.length);
+                }
+                line.write(chunk, 0, count);
             }
         }
     }
 
-    //sample is the raw non-negative APU mixer output (roughly 0.0-1.0). Never blocks -
-    //if the playback thread can't keep up, oldest queued audio is dropped rather than
-    //stalling the caller (the emulation thread).
-    //Muting alone only stops NEW samples from being queued - anything already sitting
-    //in the ring buffer keeps draining out at real-device speed regardless. That's
-    //fine for a brief mute, but the TAS Maker can generate many frames' worth of audio
-    //in a tight, non-real-time burst (a fast scroll, a long backward replay) - without
-    //also dropping whatever's already queued, that backlog keeps playing back (sounding
-    //like everything is "stacking up" and repeating) long after the emulator has moved
-    //on, and the growing backlog is itself extra work outside the emulation thread.
-    //So going from unmuted to muted always flushes the queue too - nothing queued
-    //while unmuted is expected to still matter once muted.
+    //Samples queued but not yet played (ring + device), or -1 with no usable line. Deliberately avoids lineLock:
+    //the playback thread may hold it inside a blocking write(), and the emulation thread must never wait on that.
+    public int getQueuedSamples() {
+        SourceDataLine l = line;
+        if (!running || l == null) return -1;
+        int inLine;
+        try {
+            inLine = l.getBufferSize() - l.available();
+        } catch (RuntimeException e) {
+            return -1;
+        }
+        if (inLine < 0) inLine = 0;
+        int inRing;
+        synchronized (ringLock) { inRing = available; }
+        return (inRing + inLine) / 2;
+    }
+
+    //sample is the raw non-negative APU mixer output (~0.0-1.0); never blocks, dropping the oldest queued audio instead.
+    //Going unmuted->muted also flushes the queue: the TAS Maker can burst many frames of audio while scrubbing, and
+    //without the flush that backlog keeps playing ("stacking up") long after the emulator has moved on.
     public void setMuted(boolean muted) {
         boolean wasMuted = this.muted;
         this.muted = muted;
         if (muted && !wasMuted) flush();
     }
 
-    //Discards whatever's currently queued for playback. Clearing the software ring
-    //buffer alone isn't enough - any bytes already handed to line.write() are sitting
-    //in the SourceDataLine's own internal/device buffer, outside our control, and
-    //clearing the ring does nothing to them. On Windows, once that leftover audio
-    //finishes playing, some DirectSound-backed lines don't just go silent when
-    //starved of new data - they repeat the last buffer they were given, which is
-    //exactly what made audio "stack up" and loop forever after a burst of quick
-    //scrubbing. SourceDataLine.flush() is documented to give predictable results only
-    //while stopped, so bracket it with stop()/start() rather than calling it on a
-    //running line - and hold lineLock throughout so this can't interleave with the
-    //playback thread's own line.write() call.
+    //Discards everything queued, including bytes already inside the SourceDataLine's own buffer - on Windows some
+    //DirectSound lines repeat their last buffer when starved, which made audio loop forever after quick scrubbing.
+    //SourceDataLine.flush() is only predictable while stopped, so it's bracketed with stop()/start() under lineLock.
     public void flush() {
         synchronized (ringLock) {
             available = 0;
