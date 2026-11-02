@@ -194,6 +194,9 @@ public class NESEmulator extends JFrame implements Runnable {
 
         displayPanel = new NESDisplayPanel();
         ppu.connectDisplay(displayPanel);
+        zapper = new Zapper(ppu, displayPanel);
+        bus.connectZapper(zapper);
+        installZapperMouseHandling();
 
         nametableViewerDialog = new NametableViewerDialog(this, ppu);
         ppuInspectorDialog = new PPUInspectorDialog(this, ppu);
@@ -229,7 +232,7 @@ public class NESEmulator extends JFrame implements Runnable {
             int bits = tasInputs.get(tasFrame - 1);
             preciseTraceRow = tasFrame;
             synchronized (emulationLock) {
-                setController1Tracked(bits);
+                applyTasInput(bits);
                 frameTraceBuffer.setLength(0);
                 preciseTraceStartCycle = cpu.totalCycles;
             }
@@ -307,6 +310,11 @@ public class NESEmulator extends JFrame implements Runnable {
     private final Map<String, Integer> keyBindings = new LinkedHashMap<>();
     private final Map<String, JButton> keybindButtons = new LinkedHashMap<>();
     private JDialog controllerDialog;
+    //Port device selectors ("Controller" / "Zapper") for ports 1 and 2
+    private static final String[] PORT_DEVICES = {"Controller", "Zapper"};
+    private JComboBox<String> port1DeviceCombo;
+    private JComboBox<String> port2DeviceCombo;
+    private Zapper zapper;
     private JCheckBox allowDpadConflictsCheckbox;
     private JCheckBox showInputOverlayCheckbox;
     //Last controller-1 byte applied to the bus (setController1Tracked), fed to the input overlay before each
@@ -478,6 +486,19 @@ public class NESEmulator extends JFrame implements Runnable {
         controllerDialog = new JDialog(this, "Controller Setup", false);
         controllerDialog.setLayout(new BorderLayout());
 
+        //Port device selection: a Zapper on a port replaces that port's controller; it is aimed with the
+        //mouse over the game screen and fired with the left mouse button.
+        JPanel portPanel = new JPanel(new GridLayout(2, 2, 8, 6));
+        portPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 0, 10));
+        port1DeviceCombo = new JComboBox<>(PORT_DEVICES);
+        port2DeviceCombo = new JComboBox<>(PORT_DEVICES);
+        port1DeviceCombo.addActionListener(e -> applyPortDevices());
+        port2DeviceCombo.addActionListener(e -> applyPortDevices());
+        portPanel.add(new JLabel("Port 1", SwingConstants.RIGHT));
+        portPanel.add(port1DeviceCombo);
+        portPanel.add(new JLabel("Port 2", SwingConstants.RIGHT));
+        portPanel.add(port2DeviceCombo);
+
         JPanel gridPanel = new JPanel(new GridLayout(BUTTON_NAMES.length, 2, 8, 6));
         gridPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         for (String name : BUTTON_NAMES) {
@@ -502,10 +523,58 @@ public class NESEmulator extends JFrame implements Runnable {
         bottomPanel.add(showInputOverlayCheckbox);
         bottomPanel.add(restoreDefaultsButton);
 
+        controllerDialog.add(portPanel, BorderLayout.NORTH);
         controllerDialog.add(gridPanel, BorderLayout.CENTER);
         controllerDialog.add(bottomPanel, BorderLayout.SOUTH);
         controllerDialog.pack();
         controllerDialog.setLocationRelativeTo(this);
+    }
+
+    private boolean zapperAttached() {
+        return bus.isZapperOnPort(1) || bus.isZapperOnPort(2);
+    }
+
+    //The mouse aims/fires only while no movie owns the Zapper (TAS Maker open or Play Movie running).
+    private boolean zapperMouseLive() {
+        return zapperAttached() && !tasActive && playMovieInputs == null;
+    }
+
+    private void applyPortDevices() {
+        bus.setZapperOnPort(1, port1DeviceCombo.getSelectedIndex() == 1);
+        bus.setZapperOnPort(2, port2DeviceCombo.getSelectedIndex() == 1);
+        boolean attached = zapperAttached();
+        if (!attached) {
+            zapper.setAim(null);
+            zapper.setTrigger(false);
+        }
+        displayPanel.setCursor(attached ? Cursor.getPredefinedCursor(Cursor.CROSSHAIR_CURSOR) : Cursor.getDefaultCursor());
+        rebuildTasColumns();
+    }
+
+    private void setPortDevice(int port, boolean isZapper) {
+        JComboBox<String> combo = port == 1 ? port1DeviceCombo : port2DeviceCombo;
+        if (combo.getSelectedIndex() != (isZapper ? 1 : 0)) combo.setSelectedIndex(isZapper ? 1 : 0); //fires applyPortDevices
+    }
+
+    //Mouse over the game screen aims the Zapper (letterbox-aware); left button is the trigger.
+    //Pointing off the game image counts as pointing away from the TV (no light), which games use for reloading.
+    private void installZapperMouseHandling() {
+        displayPanel.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
+            @Override public void mouseMoved(java.awt.event.MouseEvent e) { if (zapperMouseLive()) zapper.setAim(displayPanel.toNesPixel(e.getX(), e.getY())); }
+            @Override public void mouseDragged(java.awt.event.MouseEvent e) { if (zapperMouseLive()) zapper.setAim(displayPanel.toNesPixel(e.getX(), e.getY())); }
+        });
+        displayPanel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mousePressed(java.awt.event.MouseEvent e) {
+                if (!zapperMouseLive() || e.getButton() != java.awt.event.MouseEvent.BUTTON1) return;
+                zapper.setAim(displayPanel.toNesPixel(e.getX(), e.getY()));
+                zapper.setTrigger(true);
+                displayPanel.requestFocusInWindow();
+            }
+            @Override public void mouseReleased(java.awt.event.MouseEvent e) {
+                if (e.getButton() == java.awt.event.MouseEvent.BUTTON1) zapper.setTrigger(false);
+            }
+            @Override public void mouseExited(java.awt.event.MouseEvent e) { zapper.setAim(null); }
+        });
     }
 
     private int indexOfButton(String name) {
@@ -596,39 +665,136 @@ public class NESEmulator extends JFrame implements Runnable {
     private static final int[] TAS_BUTTON_BITS = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
     private static final String[] TAS_BUTTON_NAMES = {"A", "B", "s", "S", "U", "D", "L", "R"};
 
+    //Zapper input is packed into the same per-frame int as the controller-1 bits so every list operation (copy/paste,
+    //insert, save/load, blank frame = 0) keeps working unchanged: bits 8-16 = X+1 and bits 17-25 = Y+1 (0 = that
+    //coordinate is blank; a blank coordinate means the gun points off screen), bit 26 = trigger pulled.
+    //There is one Zapper record per frame; it drives whichever port(s) have "Zapper" selected in Controller Setup.
+    private static final int TAS_ZAPPER_X_SHIFT = 8;
+    private static final int TAS_ZAPPER_Y_SHIFT = 17;
+    private static final int TAS_ZAPPER_COORD_MASK = 0x1FF;
+    private static final int TAS_ZAPPER_TRIGGER_BIT = 1 << 26;
+    private static int tasZapperX(int v) { return ((v >> TAS_ZAPPER_X_SHIFT) & TAS_ZAPPER_COORD_MASK) - 1; }
+    private static int tasZapperY(int v) { return ((v >> TAS_ZAPPER_Y_SHIFT) & TAS_ZAPPER_COORD_MASK) - 1; }
+    private static boolean tasZapperTrigger(int v) { return (v & TAS_ZAPPER_TRIGGER_BIT) != 0; }
+    //x/y of -1 = blank. Each coordinate is stored independently so typing X before Y doesn't lose the X.
+    private static int tasWithZapperAim(int v, int x, int y) {
+        x = Math.max(-1, Math.min(x, NESDisplayPanel.VIEW_WIDTH - 1));
+        y = Math.max(-1, Math.min(y, NESDisplayPanel.VIEW_HEIGHT - 1));
+        v &= ~((TAS_ZAPPER_COORD_MASK << TAS_ZAPPER_X_SHIFT) | (TAS_ZAPPER_COORD_MASK << TAS_ZAPPER_Y_SHIFT));
+        return v | ((x + 1) << TAS_ZAPPER_X_SHIFT) | ((y + 1) << TAS_ZAPPER_Y_SHIFT);
+    }
+
+    //Timeline columns depend on what is plugged into the ports: a Controller on port 1 shows the eight button
+    //columns, a Zapper on either port shows X / Y (typed) and T (trigger toggle). Port 2 controllers aren't
+    //recorded by the TAS Maker, so a Controller on port 2 adds nothing.
+    private enum TasColumnKind { FRAME, BUTTON, ZAPPER_X, ZAPPER_Y, ZAPPER_TRIGGER }
+    private static final class TasColumn {
+        final TasColumnKind kind;
+        final String name;
+        final int bit; //for BUTTON / ZAPPER_TRIGGER
+        TasColumn(TasColumnKind kind, String name, int bit) {
+            this.kind = kind;
+            this.name = name;
+            this.bit = bit;
+        }
+        boolean isToggle() { return kind == TasColumnKind.BUTTON || kind == TasColumnKind.ZAPPER_TRIGGER; }
+        boolean isCoord() { return kind == TasColumnKind.ZAPPER_X || kind == TasColumnKind.ZAPPER_Y; }
+    }
+    private List<TasColumn> tasColumns = new ArrayList<>();
+
+    private List<TasColumn> computeTasColumns() {
+        List<TasColumn> cols = new ArrayList<>();
+        cols.add(new TasColumn(TasColumnKind.FRAME, "Frame", 0));
+        boolean zapper1 = bus != null && bus.isZapperOnPort(1);
+        boolean zapper2 = bus != null && bus.isZapperOnPort(2);
+        if (!zapper1) {
+            for (int i = 0; i < TAS_BUTTON_BITS.length; i++) {
+                cols.add(new TasColumn(TasColumnKind.BUTTON, TAS_BUTTON_NAMES[i], TAS_BUTTON_BITS[i]));
+            }
+        }
+        if (zapper1 || zapper2) {
+            cols.add(new TasColumn(TasColumnKind.ZAPPER_X, "X", 0));
+            cols.add(new TasColumn(TasColumnKind.ZAPPER_Y, "Y", 0));
+            cols.add(new TasColumn(TasColumnKind.ZAPPER_TRIGGER, "T", TAS_ZAPPER_TRIGGER_BIT));
+        }
+        return cols;
+    }
+
+    //Recomputes the column set after a port device change; safe before the TAS window exists.
+    private void rebuildTasColumns() {
+        tasColumns = computeTasColumns();
+        if (tasTable == null) return;
+        if (tasTable.isEditing()) tasTable.getCellEditor().cancelCellEditing();
+        suppressTasSelectionEvents = true;
+        try {
+            tasTableModel.fireTableStructureChanged();
+        } finally {
+            suppressTasSelectionEvents = false;
+        }
+        for (int i = 0; i < tasColumns.size(); i++) tasTable.getColumnModel().getColumn(i).setPreferredWidth(50);
+        syncTasSelection();
+    }
+
+    //Blank/whitespace = off screen (-1); anything unparsable = null (leave the cell alone).
+    private static Integer parseTasCoord(Object value) {
+        String text = value == null ? "" : value.toString().trim();
+        if (text.isEmpty() || text.equals("-")) return -1;
+        try {
+            return Math.max(-1, Integer.parseInt(text));
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
     //Backs the TAS Maker's frame timeline; tasInputs is the sole backing store, this
-    //model just reads/writes it (editFrameInput handles invalidation).
+    //model just reads/writes it (setFrameValue handles invalidation).
     private class TasTableModel extends AbstractTableModel {
         @Override public int getRowCount() { return tasInputs.size(); }
-        @Override public int getColumnCount() { return 1 + TAS_BUTTON_BITS.length; }
+        @Override public int getColumnCount() { return tasColumns.size(); }
 
         @Override
         public String getColumnName(int col) {
-            return col == 0 ? "Frame" : TAS_BUTTON_NAMES[col - 1];
+            return tasColumns.get(col).name;
         }
 
         @Override
         public Class<?> getColumnClass(int col) {
-            return col == 0 ? Integer.class : Boolean.class;
+            switch (tasColumns.get(col).kind) {
+                case FRAME: return Integer.class;
+                case ZAPPER_X: case ZAPPER_Y: return String.class;
+                default: return Boolean.class;
+            }
         }
 
-        //Button cells are toggled via the mouse listeners in createTASMakerWindow, not JTable's
-        //own edit machinery - editability off here prevents a double-toggle.
+        //Toggle cells (buttons, trigger) are flipped via the mouse listeners in createTASMakerWindow, not JTable's
+        //own edit machinery - editability off there prevents a double-toggle. Zapper X/Y are typed, so they do edit.
         @Override
         public boolean isCellEditable(int row, int col) {
-            return false;
+            return tasColumns.get(col).isCoord();
         }
 
         @Override
         public Object getValueAt(int row, int col) {
-            if (col == 0) return row;
-            return (tasInputs.get(row) & TAS_BUTTON_BITS[col - 1]) != 0;
+            TasColumn c = tasColumns.get(col);
+            int v = tasInputs.get(row);
+            switch (c.kind) {
+                case FRAME: return row;
+                case ZAPPER_X: { int x = tasZapperX(v); return x < 0 ? "" : Integer.toString(x); }
+                case ZAPPER_Y: { int y = tasZapperY(v); return y < 0 ? "" : Integer.toString(y); }
+                default: return (v & c.bit) != 0;
+            }
         }
 
         @Override
         public void setValueAt(Object value, int row, int col) {
-            if (col == 0) return;
-            editFrameInput(row, TAS_BUTTON_BITS[col - 1], Boolean.TRUE.equals(value));
+            TasColumn c = tasColumns.get(col);
+            if (c.isToggle()) {
+                editFrameInput(row, c.bit, Boolean.TRUE.equals(value));
+            } else if (c.isCoord()) {
+                Integer n = parseTasCoord(value);
+                if (n == null) return;
+                editFrameZapperCoord(row, c.kind == TasColumnKind.ZAPPER_X, n);
+            }
         }
     }
 
@@ -690,9 +856,22 @@ public class NESEmulator extends JFrame implements Runnable {
         public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
                                                          boolean hasFocus, int row, int column) {
             setPressed(Boolean.TRUE.equals(value));
-            setLetter(TAS_BUTTON_NAMES[column - 1]);
+            setLetter(tasColumns.get(table.convertColumnIndexToModel(column)).name);
             setBackground(isSelected ? table.getSelectionBackground() : tasRowColor(row));
             return this;
+        }
+    }
+
+    //Zapper X / Y cells: the typed coordinate (blank = off screen) on the row's validity color.
+    private class TasCoordRenderer extends DefaultTableCellRenderer {
+        TasCoordRenderer() { setHorizontalAlignment(SwingConstants.CENTER); }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
+                                                         boolean hasFocus, int row, int column) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, false, row, column);
+            c.setBackground(isSelected ? table.getSelectionBackground() : tasRowColor(row));
+            return c;
         }
     }
 
@@ -847,10 +1026,16 @@ public class NESEmulator extends JFrame implements Runnable {
         tasTable.setRowHeight(20);
         tasTable.setDefaultRenderer(Integer.class, new TasFrameNumberRenderer());
         tasTable.setDefaultRenderer(Boolean.class, new TasButtonRenderer());
-        tasTable.getColumnModel().getColumn(0).setPreferredWidth(50);
-        for (int i = 1; i <= TAS_BUTTON_BITS.length; i++) {
-            tasTable.getColumnModel().getColumn(i).setPreferredWidth(50);
-        }
+        tasTable.setDefaultRenderer(String.class, new TasCoordRenderer());
+        //Zapper X / Y: a single click opens the cell for typing; Enter or clicking elsewhere commits.
+        JTextField coordField = new JTextField();
+        coordField.setHorizontalAlignment(SwingConstants.CENTER);
+        DefaultCellEditor coordEditor = new DefaultCellEditor(coordField);
+        coordEditor.setClickCountToStart(1);
+        tasTable.setDefaultEditor(String.class, coordEditor);
+        tasTable.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE);
+        tasTable.setSurrendersFocusOnKeystroke(true);
+        rebuildTasColumns();
         //Left drag on Frame# scrubs the playhead; right drag range-selects without moving it.
         tasTable.getSelectionModel().setSelectionMode(javax.swing.ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         //Doesn't skip isAdjusting events - a left-drag scrub must seek on every intermediate row.
@@ -926,8 +1111,11 @@ public class NESEmulator extends JFrame implements Runnable {
                 int col = tasTable.columnAtPoint(e.getPoint());
                 int row = tasTable.rowAtPoint(e.getPoint());
                 if (col >= 1 && row >= 0 && row < tasInputs.size()) {
-                    int bit = TAS_BUTTON_BITS[col - 1];
+                    TasColumn column = tasColumns.get(tasTable.convertColumnIndexToModel(col));
+                    if (!column.isToggle()) return; //X / Y cells are typed, not painted
+                    int bit = column.bit;
                     tasPaintColumn = col;
+                    tasPaintBit = bit;
                     tasPaintValue = (tasInputs.get(row) & bit) == 0;
                     tasPaintLastRow = row;
                     editFrameInput(row, bit, tasPaintValue);
@@ -1033,6 +1221,7 @@ public class NESEmulator extends JFrame implements Runnable {
     //Anchor row of an in-progress right-drag-select on Frame#, or -1 if none active.
     private int tasRightDragAnchor = -1;
     private Integer tasPaintColumn = null;
+    private int tasPaintBit = 0;
     private boolean tasPaintValue;
     private int tasPaintLastRow = -1;
 
@@ -1041,7 +1230,7 @@ public class NESEmulator extends JFrame implements Runnable {
         if (tasPaintColumn == null) return;
         row = Math.max(0, Math.min(row, tasInputs.size() - 1));
         if (row == tasPaintLastRow) return;
-        int bit = TAS_BUTTON_BITS[tasPaintColumn - 1];
+        int bit = tasPaintBit;
         int step = row > tasPaintLastRow ? 1 : -1;
         for (int r = tasPaintLastRow + step; ; r += step) {
             editFrameInput(r, bit, tasPaintValue);
@@ -1083,7 +1272,8 @@ public class NESEmulator extends JFrame implements Runnable {
         if (preciseTraceDialog != null) preciseTraceDialog.refreshAvailability();
         audioPlayer.setMuted(false);
         tasDialog.setVisible(false);
-        //Hand controller 1 back to the keyboard.
+        //Hand controller 1 back to the keyboard and the Zapper back to the mouse.
+        zapper.endScripted();
         setController1Tracked(controller1Bits | queuedInputBits);
     }
 
@@ -1118,7 +1308,7 @@ public class NESEmulator extends JFrame implements Runnable {
         audioPlayer.setMuted(false);
         int executedRow = tasFrame;
         synchronized (emulationLock) {
-            setController1Tracked(bits);
+            applyTasInput(bits);
             updateEmulationFrame("TAS row " + executedRow + " (Play)");
             recordFrameStrobe(executedRow);
             tasFrame++;
@@ -1162,7 +1352,7 @@ public class NESEmulator extends JFrame implements Runnable {
             }
             for (int i = replayFrom; i < targetFrame; i++) {
                 int bits = i - 1 < tasInputs.size() ? tasInputs.get(i - 1) : 0;
-                setController1Tracked(bits);
+                applyTasInput(bits);
                 updateEmulationFrame("TAS row " + i + " (seek to " + targetFrame + ")");
                 recordFrameStrobe(i);
                 maybeCaptureTasCheckpoint(i + 1);
@@ -1173,6 +1363,13 @@ public class NESEmulator extends JFrame implements Runnable {
         renderFrameWithOverlay();
         syncTasSelection();
         tasTable.repaint();
+    }
+
+    //Applies one movie frame to the hardware: controller 1 bits plus, when a Zapper is selected on a port, the frame's
+    //recorded aim/trigger (which overrides the mouse for as long as the TAS Maker or movie playback is running).
+    private void applyTasInput(int v) {
+        setController1Tracked(v & 0xFF);
+        if (zapperAttached()) zapper.setScriptedState(tasZapperX(v), tasZapperY(v), tasZapperTrigger(v));
     }
 
     //Captures a greenzone checkpoint for executedCount frames if it's on the grid and not cached. CPU.State needs an
@@ -1229,6 +1426,20 @@ public class NESEmulator extends JFrame implements Runnable {
     private void editFrameInput(int row, int bit, boolean value) {
         int bits = tasInputs.get(row);
         bits = value ? (bits | bit) : (bits & ~bit);
+        setFrameValue(row, bits);
+    }
+
+    //Types one Zapper coordinate (-1 = blank / off screen) into a row.
+    private void editFrameZapperCoord(int row, boolean isX, int n) {
+        int v = tasInputs.get(row);
+        int x = isX ? n : tasZapperX(v);
+        int y = isX ? tasZapperY(v) : n;
+        setFrameValue(row, tasWithZapperAim(v, x, y));
+    }
+
+    //Replaces a frame's packed input value with the usual greenzone invalidation.
+    private void setFrameValue(int row, int bits) {
+        if (tasInputs.get(row) == bits) return;
         tasInputs.set(row, bits);
         if (row + 1 < tasValidFrontier) {
             tasValidFrontier = row + 1;
@@ -1458,12 +1669,32 @@ public class NESEmulator extends JFrame implements Runnable {
         for (int r : rows) editFrameInput(r, bit, newValue);
     }
 
+    //Sets one Zapper coordinate on every selected frame.
+    private void setZapperCoordOnSelection(boolean isX) {
+        int[] rows = tasTable.getSelectedRows();
+        if (rows.length == 0) return;
+        String input = JOptionPane.showInputDialog(tasDialog,
+                "Zapper " + (isX ? "X (0-255" : "Y (0-239") + ", blank = off screen) for the selected frames:", "");
+        if (input == null) return;
+        Integer n = parseTasCoord(input);
+        if (n == null) return;
+        for (int r : rows) editFrameZapperCoord(r, isX, n);
+    }
+
     private void showAddInputsMenu(Component invoker) {
         JPopupMenu menu = new JPopupMenu();
-        for (int i = 0; i < TAS_BUTTON_NAMES.length; i++) {
-            int bit = TAS_BUTTON_BITS[i];
-            JMenuItem item = new JMenuItem(TAS_BUTTON_NAMES[i]);
-            item.addActionListener(e -> toggleInputOnSelection(bit));
+        for (TasColumn c : tasColumns) {
+            if (c.kind == TasColumnKind.FRAME) continue;
+            JMenuItem item;
+            if (c.isToggle()) {
+                int bit = c.bit;
+                item = new JMenuItem(c.kind == TasColumnKind.ZAPPER_TRIGGER ? "T (Zapper trigger)" : c.name);
+                item.addActionListener(e -> toggleInputOnSelection(bit));
+            } else {
+                boolean isX = c.kind == TasColumnKind.ZAPPER_X;
+                item = new JMenuItem("Set Zapper " + c.name + "...");
+                item.addActionListener(e -> setZapperCoordOnSelection(isX));
+            }
             menu.add(item);
         }
         menu.show(invoker, 0, invoker.getHeight());
@@ -1516,10 +1747,45 @@ public class NESEmulator extends JFrame implements Runnable {
             selectedFile = new File(selectedFile.getParentFile(), selectedFile.getName() + ".tas");
         }
         try (java.io.PrintWriter writer = new java.io.PrintWriter(new java.io.FileWriter(selectedFile))) {
+            //Port devices ride along so a Zapper movie replays with the Zapper on the same port.
+            writer.println("#port1=" + (bus.isZapperOnPort(1) ? "Zapper" : "Controller"));
+            writer.println("#port2=" + (bus.isZapperOnPort(2) ? "Zapper" : "Controller"));
             for (int bits : tasInputs) writer.println(bits);
         } catch (java.io.IOException ex) {
             JOptionPane.showMessageDialog(tasDialog, "Failed to save TAS: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
         }
+    }
+
+    //Parsed .tas file: one packed input per line, with optional "#port1=Zapper"-style header lines
+    //(absent in files saved before Zapper support - those keep whatever ports are currently selected).
+    private static final class TasFile {
+        final List<Integer> inputs = new ArrayList<>();
+        Boolean zapperPort1 = null;
+        Boolean zapperPort2 = null;
+    }
+
+    private static TasFile readTasFile(File file) throws java.io.IOException, NumberFormatException {
+        TasFile result = new TasFile();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                if (line.startsWith("#")) {
+                    String lower = line.substring(1).trim().toLowerCase();
+                    if (lower.startsWith("port1=")) result.zapperPort1 = lower.endsWith("zapper");
+                    else if (lower.startsWith("port2=")) result.zapperPort2 = lower.endsWith("zapper");
+                    continue;
+                }
+                result.inputs.add(Integer.parseInt(line));
+            }
+        }
+        return result;
+    }
+
+    private void applyTasFilePorts(TasFile file) {
+        if (file.zapperPort1 != null) setPortDevice(1, file.zapperPort1);
+        if (file.zapperPort2 != null) setPortDevice(2, file.zapperPort2);
     }
 
     //Loads a movie saved by saveTas, replacing tasInputs and restarting from power-on.
@@ -1530,20 +1796,17 @@ public class NESEmulator extends JFrame implements Runnable {
         int option = fileChooser.showOpenDialog(tasDialog);
         if (option != JFileChooser.APPROVE_OPTION) return;
 
-        List<Integer> loaded = new ArrayList<>();
-        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(fileChooser.getSelectedFile()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                loaded.add(Integer.parseInt(line));
-            }
+        TasFile file;
+        try {
+            file = readTasFile(fileChooser.getSelectedFile());
         } catch (java.io.IOException | NumberFormatException ex) {
             JOptionPane.showMessageDialog(tasDialog, "Failed to load TAS: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             return;
         }
+        List<Integer> loaded = file.inputs;
 
         setTasPlaying(false);
+        applyTasFilePorts(file);
         tasInputs.clear();
         tasInputs.addAll(loaded);
         //Row 0 (hardware's pre-execution power-on state) must always exist - see openTasMaker().
@@ -1573,19 +1836,16 @@ public class NESEmulator extends JFrame implements Runnable {
         int option = fileChooser.showOpenDialog(this);
         if (option != JFileChooser.APPROVE_OPTION) return;
 
-        List<Integer> loaded = new ArrayList<>();
-        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(fileChooser.getSelectedFile()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                loaded.add(Integer.parseInt(line));
-            }
+        TasFile file;
+        try {
+            file = readTasFile(fileChooser.getSelectedFile());
         } catch (java.io.IOException | NumberFormatException ex) {
             JOptionPane.showMessageDialog(this, "Failed to load movie: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             return;
         }
+        List<Integer> loaded = file.inputs;
         if (loaded.isEmpty()) loaded.add(0); //row 0 (hardware's pre-execution power-on state)
+        applyTasFilePorts(file);
 
         r08Data = null; //movie and r08 playback are mutually exclusive
         synchronized (emulationLock) {
@@ -1968,11 +2228,12 @@ public class NESEmulator extends JFrame implements Runnable {
         if (playMovieInputs != null) {
             int idx = playMovieFrame - 1;
             if (idx < playMovieInputs.size()) {
-                setController1Tracked(playMovieInputs.get(idx));
+                applyTasInput(playMovieInputs.get(idx));
             } else {
-                //Ran out of movie input - stop movie playback, hand control back to the keyboard,
-                //but let emulation keep running.
+                //Ran out of movie input - stop movie playback, hand control back to the keyboard
+                //(and the Zapper to the mouse), but let emulation keep running.
                 playMovieInputs = null;
+                zapper.endScripted();
                 setController1Tracked(controller1Bits | queuedInputBits);
             }
         } else if (r08Data != null) {

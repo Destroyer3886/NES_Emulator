@@ -23,6 +23,22 @@ public class Bus {
     private int controller2Shift = 0;
     private boolean controllerStrobe = false;
 
+    //Zapper light gun: when attached to a port it replaces that port's controller on the data lines
+    //(the port's bit 0 then reads 0; the Zapper only drives bits 3 and 4).
+    private Zapper zapper;
+    private boolean zapperOnPort1 = false;
+    private boolean zapperOnPort2 = false;
+
+    public void connectZapper(Zapper zapper) { this.zapper = zapper; }
+
+    public void setZapperOnPort(int port, boolean attached) {
+        if (port == 1) zapperOnPort1 = attached; else zapperOnPort2 = attached;
+    }
+
+    public boolean isZapperOnPort(int port) { return port == 1 ? zapperOnPort1 : zapperOnPort2; }
+
+    private int zapperBits() { return zapper != null ? zapper.readBits() : 0x08; }
+
     //Fired on each $4016 strobe rising edge; .r08 ACE-mode playback advances to the next input
     //pair per strobe rather than per frame (see NESEmulator's onR08ControllerStrobe()).
     public Runnable onControllerStrobe;
@@ -110,6 +126,7 @@ public class Bus {
         }
         //3. Controller Port 1: shift out one bit per read; upper 3 bits open bus
         else if (address == 0x4016) {
+            if (zapperOnPort1) return (byte) ((cpuOpenBus() & 0xE0) | zapperBits());
             int bit;
             if (controllerStrobe) {
                 bit = controller1 & 0x01;
@@ -121,6 +138,7 @@ public class Bus {
         }
         //4. Controller Port 2
         else if (address == 0x4017) {
+            if (zapperOnPort2) return (byte) ((cpuOpenBus() & 0xE0) | zapperBits());
             int bit;
             if (controllerStrobe) {
                 bit = controller2 & 0x01;
@@ -240,8 +258,10 @@ public class Bus {
         } else if (address == 0x4014) {
             return 0; //write-only latch
         } else if (address == 0x4016) {
+            if (zapperOnPort1) return (byte) zapperBits();
             return (byte) (controllerStrobe ? (controller1 & 0x01) : (controller1Shift & 0x01));
         } else if (address == 0x4017) {
+            if (zapperOnPort2) return (byte) zapperBits();
             return (byte) (controllerStrobe ? (controller2 & 0x01) : (controller2Shift & 0x01));
         } else if (address >= 0x4000 && address <= 0x4015) {
             return apu.cpuRead(address);

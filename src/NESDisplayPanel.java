@@ -39,6 +39,13 @@ public class NESDisplayPanel extends JPanel {
         screenPixels[y * VIEW_WIDTH + x] = rgbColor;
     }
 
+    //Live framebuffer read (used by the Zapper's light sensor); rows the beam hasn't reached yet
+    //still hold the previous frame, exactly like a CRT's fading phosphor.
+    public int getPixel(int x, int y) {
+        if (x < 0 || x >= VIEW_WIDTH || y < 0 || y >= VIEW_HEIGHT) return 0;
+        return screenPixels[y * VIEW_WIDTH + x];
+    }
+
     //The PPU already wrote every pixel directly during stepping; this just asks Swing to repaint.
     public void renderFrame() {
         repaint();
